@@ -185,7 +185,7 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
     # The block size is the next power of two greater than n_cols, so we can fit each
     # row in a single block
     max_vec = tl.full((TILE_SIZE, ), -float('inf'), tl.float32)
-    for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+    for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
         tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
         input_ptrs = row_start_ptr + tile_offsets
         # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
@@ -195,7 +195,7 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
     denominator = float(0)
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
     accumulator = tl.zeros((TILE_SIZE, ), dtype=tl.float32)
-    for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+    for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
         tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
         input_ptrs = row_start_ptr + tile_offsets
         tile = tl.load(input_ptrs, mask=tile_offsets < n_cols, other=-float('inf'))
@@ -208,7 +208,7 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
         tl.store(output_ptrs, numerator, mask=tile_offsets < n_cols)
     denominator = tl.sum(accumulator, axis=0)
     scale = 1 / denominator
-    for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+    for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
         tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
         #input_ptrs = row_start_ptr + tile_offsets
         output_ptrs = output_row_start_ptr + tile_offsets
@@ -231,7 +231,7 @@ def softmax_kernel_pers_tiled(output_ptr, input_ptr, input_row_stride, output_ro
         # The block size is the next power of two greater than n_cols, so we can fit each
         # row in a single block
         max_vec = tl.full((TILE_SIZE, ), -float('inf'), tl.float32)
-        for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
             tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
             input_ptrs = row_start_ptr + tile_offsets
             # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
@@ -241,7 +241,7 @@ def softmax_kernel_pers_tiled(output_ptr, input_ptr, input_row_stride, output_ro
         denominator = float(0)
         output_row_start_ptr = output_ptr + row_idx * output_row_stride
         accumulator = tl.zeros((TILE_SIZE, ), dtype=tl.float32)
-        for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
             tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
             input_ptrs = row_start_ptr + tile_offsets
             tile = tl.load(input_ptrs, mask=tile_offsets < n_cols, other=-float('inf'))
@@ -254,7 +254,7 @@ def softmax_kernel_pers_tiled(output_ptr, input_ptr, input_row_stride, output_ro
             tl.store(output_ptrs, numerator, mask=tile_offsets < n_cols)
         denominator = tl.sum(accumulator, axis=0)
         scale = 1 / denominator
-        for i in range(0, tl.cdiv(n_cols + TILE_SIZE - 1, TILE_SIZE)):
+        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
             tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
             #input_ptrs = row_start_ptr + tile_offsets
             output_ptrs = output_row_start_ptr + tile_offsets
@@ -397,15 +397,15 @@ def reset_cache_dir():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],  # argument names to use as an x-axis for the plot
-        #x_vals=[128 * i for i in range(2, 34, 1)],  # different possible values for `x_name`
-        x_vals=[1024],  # different possible values for `x_name`
+        x_vals=[128 * i for i in range(2, 34, 1)],  # different possible values for `x_name`
+        #x_vals=[1024],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=LINE_VALS,  # Possible values for `line_arg`.
         line_names=LINE_NAMES,  # Label name for the lines.
         styles=LINE_STYLES,  # Line styles.
         ylabel="GB/s",  # label name for the y-axis
         plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot.
-        args={'M': 4096},  # values for function arguments not in `x_names` and `y_name`
+        args={'M': 2048},  # values for function arguments not in `x_names` and `y_name`
     ))
 def benchmark(M, N, provider):
     import os

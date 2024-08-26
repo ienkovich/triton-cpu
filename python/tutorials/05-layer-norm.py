@@ -239,6 +239,7 @@ class LayerNorm(torch.autograd.Function):
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
         if N > BLOCK_SIZE:
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        BLOCK_SIZE = 16
         # heuristics for number of warps
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
         # enqueue kernel
@@ -322,16 +323,18 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
-        x_vals=[512 * i for i in range(2, 32)],
+        x_vals=[256 * i for i in range(6, 7)],
         line_arg='provider',
-        line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
-        line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
+        #line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
+        #line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
+        line_vals=['triton'],
+        line_names=['Triton'],
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
         plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': dtype, 'mode': 'backward'},
+        args={'M': 4096, 'dtype': dtype, 'mode': 'forward'},
     ))
-def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
+def bench_layer_norm(M, N, dtype, provider, mode='forward', eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -367,7 +370,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-test_layer_norm(1151, 8192, dtype, device=device)
+#test_layer_norm(1151, 8192, dtype, device=device)
 bench_layer_norm.run(save_path='.', print_data=True, device=device)
 
 # %%

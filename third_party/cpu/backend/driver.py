@@ -16,9 +16,12 @@ _dirname = os.getenv("TRITON_SYS_PATH", default="/usr/local")
 # for locating libTritonCPURuntime
 _triton_C_dir = importlib.resources.files(triton).joinpath("_C")
 
-include_dirs = [os.path.join(_dirname, "include"), "/opt/intel/oneapi/vtune/latest/include"]
-library_dirs = [os.path.join(_dirname, "lib"), _triton_C_dir, "/opt/intel/oneapi/vtune/latest/lib64"]
-libraries = ["stdc++", "ittnotify"]
+#include_dirs = [os.path.join(_dirname, "include"), "/localdisk/ilyaenko/Intel_VTune_Profiler_2024.2.0_nda/include"]
+#library_dirs = [os.path.join(_dirname, "lib"), _triton_C_dir, "/localdisk/ilyaenko/Intel_VTune_Profiler_2024.2.0_nda/lib64"]
+#libraries = ["stdc++", "ittnotify"]
+include_dirs = [os.path.join(_dirname, "include")]
+library_dirs = [os.path.join(_dirname, "lib"), _triton_C_dir]
+libraries = ["stdc++", "tbb"]
 
 
 def compile_module_from_src(src, name):
@@ -29,6 +32,8 @@ def compile_module_from_src(src, name):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "main.cpp")
             with open(src_path, "w") as f:
+                f.write(src)
+            with open("main.cpp", "w") as f:
                 f.write(src)
             so = _build(name, src_path, tmpdir, library_dirs, include_dirs, libraries)
             with open(so, "rb") as f:
@@ -148,6 +153,7 @@ def make_launcher(constants, signature, ids):
 #include <stdio.h>
 #include <string>
 #include <memory>
+#include <tbb/tbb.h>
 
 #define ENABLE_ITT 0
 
@@ -252,11 +258,33 @@ extern "C" void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, 
   auto all_grids = get_all_grids(gridX, gridY, gridZ);
   size_t N = gridX * gridY * gridZ;
 
-#pragma omp parallel for schedule(static) num_threads(max_threads.value())
+#pragma omp parallel for schedule(static) num_threads(64)
   for (size_t i = 0; i < N; ++i) {{
     const auto [x, y, z] = all_grids[i];
     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
   }}
+
+#if ENABLE_ITT
+    __itt_task_end(dom1);
+#endif
+}}
+
+extern "C" void run_tbb_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
+#if ENABLE_ITT
+    __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
+#endif
+  // TODO: Consider using omp collapse(3) clause for simplicity?
+  auto all_grids = get_all_grids(gridX, gridY, gridZ);
+  size_t N = gridX * gridY * gridZ;
+
+  tbb::parallel_for(
+    tbb::blocked_range<size_t>(0, N),
+    [&](const tbb::blocked_range<size_t>& r) {{
+    for (size_t i = r.begin(); i != r.end(); ++i) {{
+      const auto [x, y, z] = all_grids[i];
+      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    }}
+  }});
 
 #if ENABLE_ITT
     __itt_task_end(dom1);
@@ -271,16 +299,16 @@ extern "C" void run_omp_kernels_collapse(uint32_t gridX, uint32_t gridY, uint32_
   size_t N = gridX * gridY * gridZ;
 
   // For now, use the default chunk size, total iterations / max_threads.
-//#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for collapse(3) schedule(static)
   for (size_t k = 0; k < gridZ; ++k) {{
   for (size_t j = 0; j < gridY; ++j) {{
   for (size_t i = 0; i < gridX; ++i) {{
 #if ENABLE_ITT
-    __itt_task_begin(dom1, __itt_null, __itt_null, kernel_call_str);
+//    __itt_task_begin(dom1, __itt_null, __itt_null, kernel_call_str);
 #endif
     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} i, j, k, gridX, gridY, gridZ);
 #if ENABLE_ITT
-    __itt_task_end(dom1);
+//    __itt_task_end(dom1);
 #endif
   }}
   }}
@@ -336,6 +364,9 @@ extern "C" void run_omp_kernels2(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
 #endif
 }}
 
+#include <chrono>
+#include <thread>
+
 static PyObject* launch(PyObject* self, PyObject* args) {{
 #if ENABLE_ITT
   __itt_task_begin(dom1, __itt_null, __itt_null, launcher_call_str);
@@ -348,6 +379,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *py_obj_stream;
   void* pKrnl;
 
+  auto start = std::chrono::high_resolution_clock::now();
+
   {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
                                        &kernel_metadata, &launch_metadata,
@@ -357,6 +390,17 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   void *pStream = PyLong_AsVoidPtr(py_obj_stream);
   kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
+
+  /*
+  DevicePtrInfo ptr_info = getPointer(arg0, 0);
+  std::chrono::duration<double, std::micro> total_time;
+  do {{
+    auto end = std::chrono::high_resolution_clock::now();
+    total_time = end - start;
+    *((float *)ptr_info.dev_ptr) = total_time.count();
+  }} while (total_time.count() < 200);
+  return Py_None;
+  */
 
   // extract launch metadata
   if (launch_enter_hook != Py_None){{
@@ -381,6 +425,10 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (PyErr_Occurred()) {{
     return NULL;
   }}
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::micro> total_time = end - start;
+  *((float *)ptr_info0.dev_ptr) = total_time.count();
 
 #if ENABLE_ITT
   __itt_task_end(dom1);
@@ -436,6 +484,7 @@ class CPUDriver(DriverBase):
     def __init__(self):
         self.utils = CPUUtils()
         self.launcher_cls = CPULauncher
+        self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
         super().__init__()
 
     def get_current_device(self):
@@ -447,8 +496,7 @@ class CPUDriver(DriverBase):
     def get_current_target(self):
         # Capability and warp size are zeros for CPU.
         # TODO: GPUTarget naming isn't obviously good.
-        cpu_arch = llvm.get_cpu_tripple().split("-")[0]
-        return GPUTarget("cpu", cpu_arch, 0)
+        return GPUTarget("cpu", self.cpu_arch, 0)
 
     @staticmethod
     def is_active():

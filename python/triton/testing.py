@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List
 from . import language as tl
 import triton
+import itt
 
 class CPUDeviceInterface:
 
@@ -27,6 +28,29 @@ class CPUDeviceInterface:
     def synchronize(self):
         pass
 
+class IttMock:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def resume():
+        pass
+
+    @staticmethod
+    def domain_create(name):
+        return None
+
+    @staticmethod
+    def task_begin(domain, name):
+        pass
+
+    @staticmethod
+    def task_end(domain):
+        pass
+
+itt = IttMock()
+
+domain = itt.domain_create("triton")
 
 def nvsmi(attrs):
     attrs = ','.join(attrs)
@@ -188,6 +212,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     for _ in range(n_warmup):
         fn()
     # Benchmark
+    itt.resume()
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
         # if it contains a backward pass. So we clear the
@@ -196,11 +221,15 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
             for x in grad_to_none:
                 x.grad = None
         # we clear the L2 cache before each run
-        # cache.zero_()
-        zero_cache(cache)
+        itt.task_begin(domain, "zero cache")
+        cache.zero_()
+        #zero_cache(cache)
+        itt.task_end(domain)
         # record time of `fn`
         start_event[i].record()
+        itt.task_begin(domain, "run kernel")
         fn()
+        itt.task_end(domain)
         end_event[i].record()
     # Record clocks
     di.synchronize()
