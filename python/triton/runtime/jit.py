@@ -597,29 +597,24 @@ class JITFunction(KernelInterface[T]):
 
     def run(self, *args, grid, warmup, **kwargs):
         # parse options
-        start = time.perf_counter_ns()
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
         target = driver.active.get_current_target()
         kwargs["debug"] = self.debug
-        end0 = time.perf_counter_ns()
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
-        end1 = time.perf_counter_ns()
 
         if self.binder is None:
             self.create_binder()
 
         bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
-        end2 = time.perf_counter_ns()
 
         # compute cache key
         device_key = get_device_key()
         key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
         kernel = self.cache[device_key].get(key, None)
-        end3 = time.perf_counter_ns()
 
         if kernel is None:
             # Kernel is not cached; we have to compile.
@@ -664,7 +659,6 @@ class JITFunction(KernelInterface[T]):
                 options=options.__dict__,
             )
             self.cache[device_key][key] = kernel
-        end4 = time.perf_counter_ns()
 
         # Check that used global values have not changed.
         not_present = object()
@@ -672,7 +666,6 @@ class JITFunction(KernelInterface[T]):
             if (newVal := globals_dict.get(name, not_present)) != val:
                 raise RuntimeError(
                     f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
-        end5 = time.perf_counter_ns()
 
         if not warmup:
             # canonicalize grid
@@ -689,38 +682,31 @@ class JITFunction(KernelInterface[T]):
 
             # launch kernel
             launch_metadata = kernel.launch_metadata(grid, stream, *non_constexpr_vals)
-            end6 = time.perf_counter_ns()
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)
-        end7 = time.perf_counter_ns()
 
-        return start, end0 - start, end1 - start, end2 - start, end3 - start, end4 - start, end5 - start, end6 - start, end7 - start
+        return kernel
 
     def bind(self, *args, grid, **kwargs):
         # parse options
-        start = time.perf_counter_ns()
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
         target = driver.active.get_current_target()
         kwargs["debug"] = self.debug
-        end0 = time.perf_counter_ns()
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
-        end1 = time.perf_counter_ns()
 
         if self.binder is None:
             self.create_binder()
 
         bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
-        end2 = time.perf_counter_ns()
 
         # compute cache key
         device_key = get_device_key()
         key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
         kernel = self.cache[device_key].get(key, None)
-        end3 = time.perf_counter_ns()
 
         if kernel is None:
             # Kernel is not cached; we have to compile.
@@ -765,7 +751,6 @@ class JITFunction(KernelInterface[T]):
                 options=options.__dict__,
             )
             self.cache[device_key][key] = kernel
-        end4 = time.perf_counter_ns()
 
         # Check that used global values have not changed.
         not_present = object()
@@ -773,7 +758,6 @@ class JITFunction(KernelInterface[T]):
             if (newVal := globals_dict.get(name, not_present)) != val:
                 raise RuntimeError(
                     f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
-        end5 = time.perf_counter_ns()
 
         # canonicalize grid
         assert grid is not None
@@ -788,7 +772,6 @@ class JITFunction(KernelInterface[T]):
         grid_2 = grid[2] if grid_size > 2 else 1
         # launch kernel
         launch_metadata = kernel.launch_metadata(grid, stream, *non_constexpr_vals)
-        end6 = time.perf_counter_ns()
         return lambda: kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                    self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)
 

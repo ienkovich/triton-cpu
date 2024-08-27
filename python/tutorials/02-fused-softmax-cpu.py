@@ -161,10 +161,8 @@ def softmax_orig(x, y=None):
     #    num_programs = NUM_SM * occupancy
     #    kernels[BLOCK_SIZE] = (kernel, num_programs)
 
-    num_programs = min(n_rows, 64)
-
     # Create a number of persistent programs.
-    softmax_kernel_orig[(num_programs, 1, 1)](
+    softmax_kernel_orig[(n_rows, 1, 1)](
         y,
         x,
         x.stride(0),
@@ -177,7 +175,7 @@ def softmax_orig(x, y=None):
     return y
 
 @triton.jit
-def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_cols, TILE_SIZE: tl.constexpr):
+def softmax_kernel_tiled(output_ptr, input_ptr, input_row_stride, output_row_stride, n_cols, TILE_SIZE: tl.constexpr):
     # The rows of the softmax are independent, so we parallelize across those
     row_idx = tl.program_id(0)
     # The stride represents how much we need to increase the pointer to advance 1 row
@@ -219,56 +217,11 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
         tl.store(output_ptrs, softmax_output, mask=tile_offsets < n_cols)
 
 
-@triton.jit
-def softmax_kernel_pers_tiled(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols, TILE_SIZE: tl.constexpr):
-    # The rows of the softmax are independent, so we parallelize across those
-    rows_per_prog = tl.cdiv(n_cols + tl.num_programs(0) - 1,  tl.num_programs(0))
-    row_start = tl.program_id(0) * rows_per_prog
-    row_end = min(row_start + rows_per_prog, n_rows)
-    for row_idx in range(row_start, row_end):
-        # The stride represents how much we need to increase the pointer to advance 1 row
-        row_start_ptr = input_ptr + row_idx * input_row_stride
-        # The block size is the next power of two greater than n_cols, so we can fit each
-        # row in a single block
-        max_vec = tl.full((TILE_SIZE, ), -float('inf'), tl.float32)
-        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
-            tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
-            input_ptrs = row_start_ptr + tile_offsets
-            # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
-            tile = tl.load(input_ptrs, mask=tile_offsets < n_cols, other=-float('inf'))
-            max_vec = max(max_vec, tile)
-        max_val = tl.max(max_vec, axis=0)
-        denominator = float(0)
-        output_row_start_ptr = output_ptr + row_idx * output_row_stride
-        accumulator = tl.zeros((TILE_SIZE, ), dtype=tl.float32)
-        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
-            tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
-            input_ptrs = row_start_ptr + tile_offsets
-            tile = tl.load(input_ptrs, mask=tile_offsets < n_cols, other=-float('inf'))
-            # Subtract maximum for numerical stability
-            row_minus_max = tile - max_val
-            # Note that exponentiation in Triton is fast but approximate (i.e., think __expf in CUDA)
-            numerator = tl.exp(row_minus_max)
-            accumulator = accumulator + numerator
-            output_ptrs = output_row_start_ptr + tile_offsets
-            tl.store(output_ptrs, numerator, mask=tile_offsets < n_cols)
-        denominator = tl.sum(accumulator, axis=0)
-        scale = 1 / denominator
-        for i in range(0, tl.cdiv(n_cols, TILE_SIZE)):
-            tile_offsets = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
-            #input_ptrs = row_start_ptr + tile_offsets
-            output_ptrs = output_row_start_ptr + tile_offsets
-            # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
-            tile = tl.load(output_ptrs, mask=tile_offsets < n_cols, other=-float('inf'))
-            softmax_output = tile * scale
-            # Write back output to DRAM
-            tl.store(output_ptrs, softmax_output, mask=tile_offsets < n_cols)
-
 # %%
 # We can create a helper function that enqueues the kernel and its (meta-)arguments for any given input tensor.
 
 
-def softmax(x, y=None):
+def softmax_tiled(x, y=None):
     n_rows, n_cols = x.shape
     # The block size is the smallest power of two greater than the number of columns in `x`
     TILE_SIZE = 16
@@ -286,7 +239,7 @@ def softmax(x, y=None):
         y = torch.empty_like(x)
     # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row of
     # the input matrix
-    softmax_kernel[(n_rows, )](
+    softmax_kernel_tiled[(n_rows, )](
         y,
         x,
         x.stride(0),
@@ -298,35 +251,33 @@ def softmax(x, y=None):
     return y
 
 
-def softmax_pers_tiled(x, y=None):
+def bind_softmax_orig(x, y):
     n_rows, n_cols = x.shape
-    # The block size is the smallest power of two greater than the number of columns in `x`
-    TILE_SIZE = 128
-    # Another trick we can use is to ask the compiler to use more threads per row by
-    # increasing the number of warps (`num_warps`) over which each row is distributed.
-    # You will see in the next tutorial how to auto-tune this value in a more natural
-    # way so you don't have to come up with manual heuristics yourself.
-    num_warps = 4
-    #if BLOCK_SIZE >= 2048:
-    #    num_warps = 8
-    #if BLOCK_SIZE >= 4096:
-    #    num_warps = 16
-    # Allocate output
-    if y is None:
-        y = torch.empty_like(x)
-    # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row of
-    # the input matrix
-    softmax_kernel_pers_tiled[(64, )](
+    return softmax_kernel_orig.bind(
         y,
         x,
         x.stride(0),
         y.stride(0),
         n_rows,
         n_cols,
-        num_warps=num_warps,
-        TILE_SIZE=TILE_SIZE,
+        BLOCK_SIZE=triton.next_power_of_2(n_cols),
+        grid=(n_rows, 1, 1),
+        num_stages=4,
     )
-    return y
+
+
+def bind_softmax_tiled(x, y):
+    n_rows, n_cols = x.shape
+    return softmax_kernel_tiled.bind(
+        y,
+        x,
+        x.stride(0),
+        y.stride(0),
+        n_cols,
+        TILE_SIZE=16,
+        grid=(n_rows, 1, 1),
+    )
+
 
 # %%
 # Unit Test
@@ -344,19 +295,24 @@ x = torch.randn(1823, 781, device='cpu')
 y_torch_cpu = torch.softmax(x, axis=1)
 y_triton_cpu = softmax_orig(x)
 assert torch.allclose(y_triton_cpu, y_torch_cpu), (y_triton_cpu, y_torch_cpu)
-y_triton_cpu = softmax(x)
+y_triton_cpu = softmax_tiled(x)
 assert torch.allclose(y_triton_cpu, y_torch_cpu), (y_triton_cpu, y_torch_cpu)
+y = torch.zeros_like(x)
+bind_softmax_orig(x, y)()
+assert torch.allclose(y, y_torch_cpu), (y, y_torch_cpu)
+y = torch.zeros_like(x)
+bind_softmax_tiled(x, y)()
+assert torch.allclose(y, y_torch_cpu), (y, y_torch_cpu)
 """
 
 LINE_VALS = [
 #    'triton-cpu-single',
-#    'triton-cpu-orig-nomvec',
-#    'triton-cpu-orig-mvec',
-#    'triton-cpu-tiled-nomvec',
-    'triton-cpu-tiled-mvec',
-#    'triton-cpu-tiled-pers-mvec',
+#    'triton-cpu-orig',
+#    'triton-cpu-orig-prebind',
+    'triton-cpu-tiled',
+    'triton-cpu-tiled-prebind',
+#    'triton-cpu-tiled-pers',
     'torch-cpu-compile',
-#    'torch-cpu-jit',
     'torch-cpu-native',
 ]
 #LINE_NAMES = ['Triton', 'Triton(mvec)', 'Triton(tiled)', 'Triton(tiled+mvec)', 'TorchInductor', 'TorchNative']
@@ -367,7 +323,7 @@ LINE_STYLES = [('blue', '-')] * len(LINE_NAMES)
 if USE_GPU and triton.runtime.driver.get_active_gpus():
     triton.runtime.driver.set_active_to_gpu()
     x = x.to('cuda')
-    y_triton_gpu = softmax(x)
+    y_triton_gpu = softmax_orig(x)
     y_torch_gpu = torch.softmax(x, axis=1)
     assert torch.allclose(y_triton_gpu, y_torch_gpu), (y_triton_gpu, y_torch_gpu)
     LINE_VALS += ['triton-gpu', 'torch-gpu-native', 'torch-gpu-jit']
@@ -379,7 +335,7 @@ def reset_cache_dir():
     os.environ["TRITON_CACHE_DIR"] = tmpdir
     if os.path.exists(tmpdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
-    softmax_kernel.cache.clear()
+    softmax_kernel_tiled.cache.clear()
     softmax_kernel_orig.cache.clear()
     softmax_kernel_pers.cache.clear()
 
@@ -397,7 +353,8 @@ def reset_cache_dir():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],  # argument names to use as an x-axis for the plot
-        x_vals=[128 * i for i in range(2, 34, 1)],  # different possible values for `x_name`
+        #x_vals=[128 * i for i in range(2, 34, 1)],  # different possible values for `x_name`
+        x_vals=[256 * i for i in range(2, 34, 1)],  # different possible values for `x_name`
         #x_vals=[1024],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=LINE_VALS,  # Possible values for `line_arg`.
@@ -405,7 +362,7 @@ def reset_cache_dir():
         styles=LINE_STYLES,  # Line styles.
         ylabel="GB/s",  # label name for the y-axis
         plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot.
-        args={'M': 2048},  # values for function arguments not in `x_names` and `y_name`
+        args={'M': 4096},  # values for function arguments not in `x_names` and `y_name`
     ))
 def benchmark(M, N, provider):
     import os
@@ -423,41 +380,31 @@ def benchmark(M, N, provider):
             os.environ['TRITON_CPU_SINGLE_CORE'] = '1'
         else:
             os.environ.pop('TRITON_CPU_SINGLE_CORE', None)
-
-        if 'nomvec' in provider:
-            os.environ['TRITON_CPU_NO_LIBMVEC'] = '1'
-        else:
-            os.environ.pop('TRITON_CPU_NO_LIBMVEC', None)
-
-        #reset_cache_dir()
     else:
         y = None
         triton.runtime.driver.set_active_to_gpu()
-
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch-cpu-native':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1, out=y), quantiles=quantiles,
                                                      device_type=device)
-    if provider == 'torch-cpu-jit':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_softmax(x), quantiles=quantiles, device_type=device)
     if provider == 'torch-cpu-compile':
         compiled = torch.compile(softmax_for_compile)
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: compiled(x, y), quantiles=quantiles, device_type=device)
     if provider == 'triton-cpu-single':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x, y), quantiles=quantiles, device_type=device)
-    if provider == 'triton-cpu-orig-nomvec':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_tiled(x, y), quantiles=quantiles, device_type=device)
+    if provider == 'triton-cpu-orig':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_orig(x, y), quantiles=quantiles, device_type=device)
-    if provider == 'triton-cpu-orig-mvec':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_orig(x, y), quantiles=quantiles, device_type=device)
-    if provider == 'triton-cpu-tiled-nomvec':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x, y), quantiles=quantiles, device_type=device)
-    if provider == 'triton-cpu-tiled-mvec':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x, y), quantiles=quantiles, device_type=device)
-    if provider == 'triton-cpu-tiled-pers-mvec':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_pers_tiled(x, y), quantiles=quantiles, device_type=device)
+    if provider == 'triton-cpu-orig-prebind':
+        kernel_prebind = bind_softmax_orig(x, y)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: kernel_prebind(), quantiles=quantiles, device_type=device)
+    if provider == 'triton-cpu-tiled':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_tiled(x, y), quantiles=quantiles, device_type=device)
+    if provider == 'triton-cpu-tiled-prebind':
+        kernel_prebind = bind_softmax_tiled(x, y)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: kernel_prebind(), quantiles=quantiles, device_type=device)
     if provider == 'triton-gpu':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x), quantiles=quantiles, device_type=device)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_orig(x), quantiles=quantiles, device_type=device)
     if provider == 'torch-gpu-native':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1), quantiles=quantiles,
                                                      device_type=device)
