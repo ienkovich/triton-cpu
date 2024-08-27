@@ -153,7 +153,6 @@ def make_launcher(constants, signature, ids):
 #include <stdio.h>
 #include <string>
 #include <memory>
-#include <tbb/tbb.h>
 
 #define ENABLE_ITT 0
 
@@ -269,28 +268,6 @@ extern "C" void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, 
 #endif
 }}
 
-extern "C" void run_tbb_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-#if ENABLE_ITT
-    __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
-#endif
-  // TODO: Consider using omp collapse(3) clause for simplicity?
-  auto all_grids = get_all_grids(gridX, gridY, gridZ);
-  size_t N = gridX * gridY * gridZ;
-
-  tbb::parallel_for(
-    tbb::blocked_range<size_t>(0, N),
-    [&](const tbb::blocked_range<size_t>& r) {{
-    for (size_t i = r.begin(); i != r.end(); ++i) {{
-      const auto [x, y, z] = all_grids[i];
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
-    }}
-  }});
-
-#if ENABLE_ITT
-    __itt_task_end(dom1);
-#endif
-}}
-
 extern "C" void run_omp_kernels_collapse(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
 #if ENABLE_ITT
     __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
@@ -319,54 +296,6 @@ extern "C" void run_omp_kernels_collapse(uint32_t gridX, uint32_t gridY, uint32_
 #endif
 }}
 
-extern "C" void run_omp_kernels2(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-#if ENABLE_ITT
-    __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
-#endif
-  // TODO: Consider using omp collapse(3) clause for simplicity?
-  size_t N = gridX * gridY * gridZ;
-
-  // For now, use the default chunk size, total iterations / max_threads.
-#pragma omp parallel
-  {{
-    int64_t num_threads = omp_get_num_threads();
-    int64_t tid = omp_get_thread_num();
-    int64_t iters_per_thread = (N + num_threads - 1) / num_threads;
-    int64_t start = iters_per_thread * tid;
-    int64_t end = std::min((int64_t)N, start + iters_per_thread);
-    int64_t X = start % gridX;
-    int64_t Y = start / gridX % gridY;
-    int64_t Z = start / gridX / gridY;
-    for (int64_t i = start; i < end; ++i) {{
-      /*
-      ++X;
-      if (X == gridX) {{
-        X = 0;
-        ++Y;
-        if (Y == gridY) {{
-          Y = 0;
-          ++Z;
-        }}
-      }}
-      */
-#if ENABLE_ITT
-      __itt_task_begin(dom1, __itt_null, __itt_null, kernel_call_str);
-#endif
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} i, Y, Z, gridX, gridY, gridZ);
-#if ENABLE_ITT
-      __itt_task_end(dom1);
-#endif
-    }}
-  }}
-
-#if ENABLE_ITT
-    __itt_task_end(dom1);
-#endif
-}}
-
-#include <chrono>
-#include <thread>
-
 static PyObject* launch(PyObject* self, PyObject* args) {{
 #if ENABLE_ITT
   __itt_task_begin(dom1, __itt_null, __itt_null, launcher_call_str);
@@ -379,8 +308,6 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *py_obj_stream;
   void* pKrnl;
 
-  auto start = std::chrono::high_resolution_clock::now();
-
   {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
                                        &kernel_metadata, &launch_metadata,
@@ -390,17 +317,6 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   void *pStream = PyLong_AsVoidPtr(py_obj_stream);
   kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
-
-  /*
-  DevicePtrInfo ptr_info = getPointer(arg0, 0);
-  std::chrono::duration<double, std::micro> total_time;
-  do {{
-    auto end = std::chrono::high_resolution_clock::now();
-    total_time = end - start;
-    *((float *)ptr_info.dev_ptr) = total_time.count();
-  }} while (total_time.count() < 200);
-  return Py_None;
-  */
 
   // extract launch metadata
   if (launch_enter_hook != Py_None){{
@@ -425,10 +341,6 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (PyErr_Occurred()) {{
     return NULL;
   }}
-
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::micro> total_time = end - start;
-  *((float *)ptr_info0.dev_ptr) = total_time.count();
 
 #if ENABLE_ITT
   __itt_task_end(dom1);
