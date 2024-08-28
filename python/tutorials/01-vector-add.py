@@ -109,14 +109,6 @@ def add(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor, device):
     # running asynchronously at this point.
     return output
 
-def bind_kernel(x: torch.Tensor, y: torch.Tensor, output):
-    if output is None:
-        output = torch.empty_like(x)
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    return add_kernel.bind(x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE, grid=grid)
-
-
 def add_tiled(x: torch.Tensor, y: torch.Tensor, output):
     if output is None:
         output = torch.empty_like(x)
@@ -124,13 +116,6 @@ def add_tiled(x: torch.Tensor, y: torch.Tensor, output):
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
     add_kernel_tiled[grid](x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE, TILE_SIZE=16)
     return output
-
-def bind_tiled_kernel(x: torch.Tensor, y: torch.Tensor, output):
-    if output is None:
-        output = torch.empty_like(x)
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    return add_kernel_tiled.bind(x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE, TILE_SIZE=16, grid=grid)
 
 
 # %%
@@ -151,8 +136,8 @@ output_triton_cpu = add_tiled(x, y, None)
 print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
 
-LINE_VALS = ['triton', 'triton-prebind', 'triton-tiled', 'triton-tiled-prebind', 'torch']
-LINE_NAMES = ['Triton', 'TritonPrebind', 'TritonTiled', 'TritonTiledPrebind', 'Torch']
+LINE_VALS = ['triton-cpu', 'triton-cpu-hooks', 'triton-cpu-tiled', 'triton-cpu-tiled-hooks', 'torch-cpu']
+LINE_NAMES = ['TritonCPU', 'TritonCPU (hooks)', 'TritonCPUTiled', 'TritonCPUTiled (hooks)', 'TorchCPU']
 LINE_STYLES = [('blue', '--'), ('blue', '-'), ('blue', '-'), ('blue', '-'), ('green', '-')]
 
 if USE_GPU and triton.runtime.driver.get_active_gpus():
@@ -198,7 +183,6 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(size, provider):
-    import os
 
     device = triton.runtime.driver.active.get_current_target().backend
     x = torch.rand(size, device=device, dtype=torch.float32)
@@ -212,25 +196,23 @@ def benchmark(size, provider):
     elif provider == 'triton-gpu':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y, None, False), quantiles=quantiles,
                                                      device_type=device)
-    elif provider == 'torch':
+    elif provider == 'torch-cpu':
         # Note that we preallocate the output buffer here to only measure the kernel performance
         # without a large chunk of memory allocation.
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.add(x, y, out=output), quantiles=quantiles,
                                                      device_type=device)
-    elif provider == 'triton':
+    elif provider == 'triton-cpu':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y, output, device), quantiles=quantiles,
                                                      device_type=device)
-    elif provider == 'triton-prebind':
-        kernel_prebind = bind_kernel(x, y, output)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: kernel_prebind(), quantiles=quantiles,
-                                                     device_type=device)
-    elif provider == 'triton-tiled':
+    elif provider == 'triton-cpu-hooks':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y, output, device), quantiles=quantiles,
+                                                     device_type=device, measure_time_with_hooks=True)
+    elif provider == 'triton-cpu-tiled':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add_tiled(x, y, output), quantiles=quantiles,
                                                      device_type=device)
-    elif provider == 'triton-tiled-prebind':
-        tiled_kernel_prebind = bind_tiled_kernel(x, y, output)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: tiled_kernel_prebind(), quantiles=quantiles,
-                                                     device_type=device)
+    elif provider == 'triton-cpu-tiled-hooks':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add_tiled(x, y, output), quantiles=quantiles,
+                                                     device_type=device, measure_time_with_hooks=True)
     gbps = lambda ms: 3 * x.numel() * x.element_size() / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
