@@ -228,6 +228,7 @@ class LayerNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, normalized_shape, weight, bias, eps):
         # allocate output
+        # zero-initialize to avoid page faults during execution
         y = torch.zeros_like(x)
         # reshape input data into 2D tensor
         x_arg = x.reshape(-1, x.shape[-1])

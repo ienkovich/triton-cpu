@@ -15,7 +15,6 @@ from pathlib import Path
 import re
 import functools
 import os
-import time
 
 
 @dataclass
@@ -372,12 +371,10 @@ class CompiledKernel:
         # (e.g., checking amount of shared memory on current device)
         self.module = None
         self.function = None
-        self.init_handles_time = [0, 0]
 
     def _init_handles(self):
         if self.module is not None:
             return
-        start = time.perf_counter_ns()
         device = driver.active.get_current_device()
         # create launcher
         self.run = driver.active.launcher_cls(self.src, self.metadata)
@@ -388,9 +385,6 @@ class CompiledKernel:
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
         self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
-        end = time.perf_counter_ns()
-        self.init_handles_time[0] += 1
-        self.init_handles_time[1] += (end - start) / 1000
 
     def __getattribute__(self, name):
         if name == 'run':

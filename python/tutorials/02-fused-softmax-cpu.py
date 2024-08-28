@@ -20,8 +20,6 @@ In doing so, you will learn about:
 #
 # Custom GPU kernels for elementwise additions are educationally valuable but won't get you very far in practice.
 # Let us consider instead the case of a simple (numerically stabilized) softmax operation:
-import os
-import shutil
 
 import torch
 
@@ -32,7 +30,7 @@ USE_GPU = False
 
 
 @torch.jit.script
-def naive_softmax(x, y):
+def naive_softmax(x):
     """Compute row-wise softmax of X using native pytorch
 
     We subtract the maximum element in order to avoid overflows. Softmax is invariant to
@@ -47,10 +45,9 @@ def naive_softmax(x, y):
     # read  MN elements ; write M  elements
     denominator = numerator.sum(dim=1)
     # read MN + M elements ; write MN elements
-    #ret = numerator / denominator[:, None]
-    torch.div(numerator, denominator[:, None], out=y)
+    ret = numerator / denominator[:, None]
     # in total: read 5MN + 2M elements ; wrote 3MN + 2M elements
-    #return ret
+    return ret
 
 
 def softmax_for_compile(x, y):
@@ -81,8 +78,7 @@ def softmax_for_compile(x, y):
 
 
 @triton.jit
-def softmax_kernel_orig(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols,
-                        BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr):
+def softmax_kernel_orig(output_ptr, input_ptr, input_row_stride, output_row_stride, n_cols, BLOCK_SIZE: tl.constexpr):
     # starting row of the program
     row_idx = tl.program_id(0)
     # The stride represents how much we need to increase the pointer to advance 1 row
@@ -106,77 +102,23 @@ def softmax_kernel_orig(output_ptr, input_ptr, input_row_stride, output_row_stri
     tl.store(output_ptrs, softmax_output, mask=mask)
 
 
-@triton.jit
-def softmax_kernel_pers(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols,
-                        BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr):
-    # starting row of the program
-    row_start = tl.program_id(0)
-    row_step = tl.num_programs(0)
-    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
-        # The stride represents how much we need to increase the pointer to advance 1 row
-        row_start_ptr = input_ptr + row_idx * input_row_stride
-        # The block size is the next power of two greater than n_cols, so we can fit each
-        # row in a single block
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        input_ptrs = row_start_ptr + col_offsets
-        # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
-        mask = col_offsets < n_cols
-        row = tl.load(input_ptrs, mask=mask, other=-float('inf'))
-        # Subtract maximum for numerical stability
-        row_minus_max = row - tl.max(row, axis=0)
-        # Note that exponentiation in Triton is fast but approximate (i.e., think __expf in CUDA)
-        numerator = tl.exp(row_minus_max)
-        denominator = tl.sum(numerator, axis=0)
-        softmax_output = numerator / denominator
-        # Write back output to DRAM
-        output_row_start_ptr = output_ptr + row_idx * output_row_stride
-        output_ptrs = output_row_start_ptr + col_offsets
-        tl.store(output_ptrs, softmax_output, mask=mask)
-
-
 def softmax_orig(x, y=None):
     n_rows, n_cols = x.shape
 
     # The block size of each loop iteration is the smallest power of two greater than the number of columns in `x`
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
 
-    # Another trick we can use is to ask the compiler to use more threads per row by
-    # increasing the number of warps (`num_warps`) over which each row is distributed.
-    # You will see in the next tutorial how to auto-tune this value in a more natural
-    # way so you don't have to come up with manual heuristics yourself.
-    num_warps = 8
-
-    # Number of software piepling stages.
-    num_stages = 4  #if SIZE_SMEM > 200000 else 2
-
     # Allocate output
     if y is None:
         y = torch.empty_like(x)
 
-    # pre-compile kernel to get register usage and compute thread occupancy.
-    #kernel, num_programs = kernels.get(BLOCK_SIZE, (None, 0))
-    #if kernel is None:
-    #    kernel = softmax_kernel.warmup(y, x, x.stride(0), y.stride(0), n_rows, n_cols, BLOCK_SIZE=BLOCK_SIZE,
-    #                                   num_stages=num_stages, num_warps=num_warps, grid=(1, ))
-    #    kernel._init_handles()
-    #    n_regs = kernel.n_regs
-    #    size_smem = kernel.metadata.shared
-    #    occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
-    #    occupancy = min(occupancy, SIZE_SMEM // size_smem)
-    #    num_programs = NUM_SM * occupancy
-    #    kernels[BLOCK_SIZE] = (kernel, num_programs)
-
-    # Create a number of persistent programs.
     softmax_kernel_orig[(n_rows, 1, 1)](
         y,
         x,
         x.stride(0),
         y.stride(0),
-        n_rows,
         n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_stages=num_stages,
-        num_warps=num_warps,
     )
     return y
 
@@ -230,20 +172,10 @@ def softmax_kernel_tiled(output_ptr, input_ptr, input_row_stride, output_row_str
 
 def softmax_tiled(x, y=None):
     n_rows, n_cols = x.shape
-    # The block size is the smallest power of two greater than the number of columns in `x`
-    TILE_SIZE = 16
-    # Another trick we can use is to ask the compiler to use more threads per row by
-    # increasing the number of warps (`num_warps`) over which each row is distributed.
-    # You will see in the next tutorial how to auto-tune this value in a more natural
-    # way so you don't have to come up with manual heuristics yourself.
-    num_warps = 4
-    #if BLOCK_SIZE >= 2048:
-    #    num_warps = 8
-    #if BLOCK_SIZE >= 4096:
-    #    num_warps = 16
-    # Allocate output
+
     if y is None:
         y = torch.empty_like(x)
+
     # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row of
     # the input matrix
     softmax_kernel_tiled[(n_rows, )](
@@ -252,8 +184,7 @@ def softmax_tiled(x, y=None):
         x.stride(0),
         y.stride(0),
         n_cols,
-        num_warps=num_warps,
-        TILE_SIZE=TILE_SIZE,
+        TILE_SIZE=16,
     )
     return y
 
@@ -283,8 +214,6 @@ LINE_VALS = [
     'torch-cpu-compile',
     'torch-cpu-native',
 ]
-#LINE_NAMES = ['Triton', 'Triton(mvec)', 'Triton(tiled)', 'Triton(tiled+mvec)', 'TorchInductor', 'TorchNative']
-#LINE_STYLES = [('blue', '-'), ('blue', '-'), ('green', '-'), ('green', '--'), ('green', '--'), ('green', '-.')]
 LINE_NAMES = LINE_VALS
 LINE_STYLES = [('blue', '-')] * len(LINE_NAMES)
 
@@ -297,18 +226,6 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
     LINE_VALS += ['triton-gpu', 'torch-gpu-native', 'torch-gpu-jit']
     LINE_NAMES += ['TritonGPU', 'TorchGPU (native)', 'TorchGPU (jit)']
     LINE_STYLES += [('yellow', '-'), ('red', '-'), ('red', '--')]
-
-tmpdir = ".tmp"
-
-
-def reset_cache_dir():
-    os.environ["TRITON_CACHE_DIR"] = tmpdir
-    if os.path.exists(tmpdir):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    softmax_kernel_tiled.cache.clear()
-    softmax_kernel_orig.cache.clear()
-    softmax_kernel_pers.cache.clear()
-
 
 # %%
 # As expected, the results are identical.

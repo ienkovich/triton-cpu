@@ -24,7 +24,7 @@ import triton
 import triton.language as tl
 
 GPU_BLOCK_SIZE = 1024
-CPU_BLOCK_SIZE = 2048
+CPU_BLOCK_SIZE = 4096
 USE_GPU = False
 
 
@@ -184,11 +184,20 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(size, provider):
+    import os
 
     device = triton.runtime.driver.active.get_current_target().backend
     x = torch.rand(size, device=device, dtype=torch.float32)
     y = torch.rand(size, device=device, dtype=torch.float32)
 
+    if device == 'cpu':
+        triton.runtime.driver.set_active_to_cpu()
+        if 'single' in provider:
+            os.environ['TRITON_CPU_SINGLE_CORE'] = '1'
+        else:
+            os.unsetenv('TRITON_CPU_SINGLE_CORE')
+    else:
+        triton.runtime.driver.set_active_to_gpu()
     output = torch.empty_like(x)
 
     quantiles = [0.5, 0.2, 0.8]

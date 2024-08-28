@@ -16,12 +16,9 @@ _dirname = os.getenv("TRITON_SYS_PATH", default="/usr/local")
 # for locating libTritonCPURuntime
 _triton_C_dir = importlib.resources.files(triton).joinpath("_C")
 
-#include_dirs = [os.path.join(_dirname, "include"), "/localdisk/ilyaenko/Intel_VTune_Profiler_2024.2.0_nda/include"]
-#library_dirs = [os.path.join(_dirname, "lib"), _triton_C_dir, "/localdisk/ilyaenko/Intel_VTune_Profiler_2024.2.0_nda/lib64"]
-#libraries = ["stdc++", "ittnotify"]
 include_dirs = [os.path.join(_dirname, "include")]
 library_dirs = [os.path.join(_dirname, "lib"), _triton_C_dir]
-libraries = ["stdc++", "tbb"]
+libraries = ["stdc++"]
 
 
 def compile_module_from_src(src, name):
@@ -32,8 +29,6 @@ def compile_module_from_src(src, name):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "main.cpp")
             with open(src_path, "w") as f:
-                f.write(src)
-            with open("main.cpp", "w") as f:
                 f.write(src)
             so = _build(name, src_path, tmpdir, library_dirs, include_dirs, libraries)
             with open(so, "rb") as f:
@@ -148,12 +143,6 @@ def make_launcher(constants, signature, ids):
 #include <string>
 #include <memory>
 
-#define ENABLE_ITT 0
-
-#if ENABLE_ITT
-#include <ittnotify.h>
-#endif
-
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <Python.h>
 
@@ -164,15 +153,6 @@ inline bool getBoolEnv(const std::string &env) {{
                  [](unsigned char c) {{ return std::tolower(c); }});
   return str == "on" || str == "true" || str == "1";
 }}
-
-#if ENABLE_ITT
-auto dom1 = __itt_domain_create("launcher");
-//auto dom2 = __itt_domain_create("omp_launcher");
-//auto dom3 = __itt_domain_create("thread");
-__itt_string_handle* launcher_call_str = __itt_string_handle_create("launcher call");
-__itt_string_handle* omp_launcher_call_str = __itt_string_handle_create("omp launcher call");
-__itt_string_handle* kernel_call_str = __itt_string_handle_create("kernel call");
-#endif
 
 inline std::optional<int64_t> getIntEnv(const std::string &env) {{
   const char *cstr = std::getenv(env.c_str());
@@ -244,9 +224,6 @@ static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t gridX, uint32_t gri
 }}
 
 extern "C" void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-#if ENABLE_ITT
-    __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
-#endif
   // TODO: Consider using omp collapse(3) clause for simplicity?
   auto all_grids = get_all_grids(gridX, gridY, gridZ);
   size_t N = gridX * gridY * gridZ;
@@ -256,44 +233,9 @@ extern "C" void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, 
     const auto [x, y, z] = all_grids[i];
     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
   }}
-
-#if ENABLE_ITT
-    __itt_task_end(dom1);
-#endif
-}}
-
-extern "C" void run_omp_kernels_collapse(uint32_t gridX, uint32_t gridY, uint32_t gridZ, kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-#if ENABLE_ITT
-    __itt_task_begin(dom1, __itt_null, __itt_null, omp_launcher_call_str);
-#endif
-  // TODO: Consider using omp collapse(3) clause for simplicity?
-  size_t N = gridX * gridY * gridZ;
-
-  // For now, use the default chunk size, total iterations / max_threads.
-#pragma omp parallel for collapse(3) schedule(static)
-  for (size_t k = 0; k < gridZ; ++k) {{
-  for (size_t j = 0; j < gridY; ++j) {{
-  for (size_t i = 0; i < gridX; ++i) {{
-#if ENABLE_ITT
-//    __itt_task_begin(dom1, __itt_null, __itt_null, kernel_call_str);
-#endif
-    (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} i, j, k, gridX, gridY, gridZ);
-#if ENABLE_ITT
-//    __itt_task_end(dom1);
-#endif
-  }}
-  }}
-  }}
-
-#if ENABLE_ITT
-    __itt_task_end(dom1);
-#endif
 }}
 
 static PyObject* launch(PyObject* self, PyObject* args) {{
-#if ENABLE_ITT
-  __itt_task_begin(dom1, __itt_null, __itt_null, launcher_call_str);
-#endif
   int gridX, gridY, gridZ;
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
@@ -336,9 +278,6 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
-#if ENABLE_ITT
-  __itt_task_end(dom1);
-#endif
   // return None
   Py_INCREF(Py_None);
   return Py_None;
