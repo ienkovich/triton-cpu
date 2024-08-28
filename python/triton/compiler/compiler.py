@@ -392,7 +392,6 @@ class CompiledKernel:
         self.init_handles_time[0] += 1
         self.init_handles_time[1] += (end - start) / 1000
 
-
     def __getattribute__(self, name):
         if name == 'run':
             self._init_handles()

@@ -157,7 +157,6 @@ struct ReduceOpConversion
 
   LogicalResult detectReductionKind(Operation *op,
                                     vector::CombiningKind &out) const {
-      return failure();
     if (isa<arith::AddFOp, arith::AddIOp>(op))
       out = vector::CombiningKind::ADD;
     else if (isa<arith::MulFOp, arith::MulIOp>(op))

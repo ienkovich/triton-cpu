@@ -7,50 +7,62 @@ from contextlib import contextmanager
 from typing import Any, Dict, List
 from . import language as tl
 import triton
-import itt
+
 
 class CPUDeviceInterface:
 
-    class Event:
+    class HooksTimeAccessor:
 
-        def __init__(self, enable_timing=True):
-            self.time = 0
+        def __init__(self, di):
+            self.di = di
+            self.record_idx = 0
 
         def elapsed_time(self, end_event) -> float:
-            return (end_event.time - self.time) * 1000
+            total_time = 0
+            for i in range(self.record_idx, end_event.record_idx):
+                total_time += self.di.kernel_times[i]
+            return total_time * 1000
 
         def record(self):
-            self.time = time.perf_counter()
+            self.record_idx = len(self.di.kernel_times)
+
+    class TimerEvent:
+
+        def __init__(self):
+            self.timer = 0
+
+        def elapsed_time(self, end_event) -> float:
+            return (end_event.timer - self.timer) * 1000
+
+        def record(self):
+            self.timer = time.perf_counter()
 
     def __init__(self):
-        pass
+        self.kernel_times = []
+        self.last_start = 0
+        self.use_hooks = False
+        triton.compiler.CompiledKernel.launch_enter_hook = None
+        triton.compiler.CompiledKernel.launch_exit_hook = None
+
+    def enable_hook_timing(self):
+        self.use_hooks = True
+        triton.compiler.CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
+        triton.compiler.CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
 
     def synchronize(self):
         pass
 
-class IttMock:
-    def __init__(self):
-        pass
+    def _enter_hook(self):
+        self.last_start = time.perf_counter()
 
-    @staticmethod
-    def resume():
-        pass
+    def _exit_hook(self):
+        self.kernel_times.append(time.perf_counter() - self.last_start)
 
-    @staticmethod
-    def domain_create(name):
-        return None
+    def Event(self, enable_timing=True):
+        if self.use_hooks:
+            return CPUDeviceInterface.HooksTimeAccessor(self)
+        return CPUDeviceInterface.TimerEvent()
 
-    @staticmethod
-    def task_begin(domain, name):
-        pass
-
-    @staticmethod
-    def task_end(domain):
-        pass
-
-itt = IttMock()
-
-domain = itt.domain_create("triton")
 
 def nvsmi(attrs):
     attrs = ','.join(attrs)
@@ -135,20 +147,9 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, quantiles=None, return_mod
             ret += [start_event.elapsed_time(end_event) / n_repeat]
         return _summarize_statistics(torch.tensor(ret), quantiles, return_mode)
 
-def zero_cache(cache):
-
-    @triton.jit
-    def kernel_fill_zero(out, BLOCK_SIZE: tl.constexpr):
-        start = tl.program_id(0)
-        offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        zero = tl.full((BLOCK_SIZE, ), 0, dtype=tl.int32)
-        tl.store(out + offs, zero)
-
-    assert cache.shape[0] % 1024 == 0
-    kernel_fill_zero[(cache.shape[0] // 1024, )](cache, 1024)
 
 def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean",
-             device_type="cuda"):
+             device_type="cuda", measure_time_with_hooks=False):
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -203,6 +204,11 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     di.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
 
+    # For CPU we can use entry and exit hooks to measure execution time
+    # more precisely.
+    if measure_time_with_hooks:
+        di.enable_hook_timing()
+
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
@@ -212,7 +218,6 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     for _ in range(n_warmup):
         fn()
     # Benchmark
-    itt.resume()
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
         # if it contains a backward pass. So we clear the
@@ -221,15 +226,10 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
             for x in grad_to_none:
                 x.grad = None
         # we clear the L2 cache before each run
-        itt.task_begin(domain, "zero cache")
         cache.zero_()
-        #zero_cache(cache)
-        itt.task_end(domain)
         # record time of `fn`
         start_event[i].record()
-        itt.task_begin(domain, "run kernel")
         fn()
-        itt.task_end(domain)
         end_event[i].record()
     # Record clocks
     di.synchronize()
