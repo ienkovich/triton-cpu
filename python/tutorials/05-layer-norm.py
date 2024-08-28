@@ -226,20 +226,22 @@ def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
 class LayerNorm(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, x_arg, y, mean, rstd, normalized_shape, weight, bias, eps):
+    def forward(ctx, x, normalized_shape, weight, bias, eps):
         # allocate output
-        #y = torch.empty_like(x)
+        y = torch.zeros_like(x)
         # reshape input data into 2D tensor
-        #x_arg = x.reshape(-1, x.shape[-1])
+        x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
-        #mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
-        #rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
+        mean = torch.zeros((M, ), dtype=torch.float32, device=x.device)
+        rstd = torch.zeros((M, ), dtype=torch.float32, device=x.device)
         # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x_arg.element_size()
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-        if N > BLOCK_SIZE:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        BLOCK_SIZE = 16
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        if x.device.type == 'cpu':
+            BLOCK_SIZE = 16
+        else:
+            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+            if N > BLOCK_SIZE:
+                raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
         # heuristics for number of warps
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
         # enqueue kernel
@@ -252,39 +254,6 @@ class LayerNorm(torch.autograd.Function):
         ctx.num_warps = num_warps
         ctx.eps = eps
         return y
-
-    @staticmethod
-    def bind(x_arg, y, mean, rstd, normalized_shape, weight, bias, eps):
-        # allocate output
-        #y = torch.empty_like(x)
-        # reshape input data into 2D tensor
-        #x_arg = x.reshape(-1, x.shape[-1])
-        M, N = x_arg.shape
-        #mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
-        #rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x_arg.element_size()
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-        if N > BLOCK_SIZE:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        BLOCK_SIZE = 16
-        # heuristics for number of warps
-        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
-        # enqueue kernel
-        kernel_prebind = _layer_norm_fwd_fused.bind(  #
-            x_arg, y, weight, bias, mean, rstd,  #
-            x_arg.stride(0), N, eps,  #
-            BLOCK_SIZE=BLOCK_SIZE, grid=(M, ), num_warps=num_warps, num_ctas=1)
-        #ctx.save_for_backward(x, weight, bias, mean, rstd)
-        #ctx.BLOCK_SIZE = BLOCK_SIZE
-        #ctx.num_warps = num_warps
-        #ctx.eps = eps
-
-        def runner():
-            kernel_prebind()
-            return y
-
-        return runner
 
     @staticmethod
     def backward(ctx, dy):
@@ -356,12 +325,11 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
-        x_vals=[256 * i for i in range(2, 16)],
+        x_vals=[256 * i for i in range(2, 24)],
         line_arg='provider',
-        #line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
-        #line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
-        line_vals=['triton', 'triton-prebind', 'torch'],
-        line_names=['triton', 'triton-prebind', 'torch'],
+        line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []) + (['triton-hooks'] if device == 'cpu' else []),
+        line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []) +
+        (['Triton (hooks)'] if device == 'cpu' else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
         plot_name='layer-norm-backward',
@@ -377,22 +345,11 @@ def bench_layer_norm(M, N, dtype, provider, mode='forward', eps=1e-5, device='cu
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     quantiles = [0.5, 0.2, 0.8]
-
-    y = torch.empty_like(x)
-    # reshape input data into 2D tensor
-    x_arg = x.reshape(-1, x.shape[-1])
-    M, N = x_arg.shape
-    mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
-    rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
-
-    layer_norm_prebind = LayerNorm.bind(x_arg, y, mean, rstd, w_shape, weight, bias, eps)
+    use_hooks = 'hooks' in provider
 
     def y_fwd():
-        if provider == "triton-prebind":
-            return layer_norm_prebind()  # noqa: F811, E704
-
-        if provider == "triton":
-            return layer_norm(x, x_arg, y, mean, rstd, w_shape, weight, bias, eps)  # noqa: F811, E704
+        if provider == "triton" or provider == "triton-hooks":
+            return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
 
         if provider == "torch":
             return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
@@ -404,13 +361,15 @@ def bench_layer_norm(M, N, dtype, provider, mode='forward', eps=1e-5, device='cu
     # forward pass
     if mode == 'forward':
         gbps = lambda ms: 2 * x.numel() * x.element_size() / ms * 1e-6
-        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500, device_type=device)
+        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500, device_type=device,
+                                                     measure_time_with_hooks=use_hooks)
     # backward pass
     if mode == 'backward':
         y = y_fwd()
         gbps = lambda ms: 3 * x.numel() * x.element_size() / ms * 1e-6  # noqa: F811, E704
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True), quantiles=quantiles,
-                                                     grad_to_none=[x], rep=500, device_type=device)
+                                                     grad_to_none=[x], rep=500, device_type=device,
+                                                     measure_time_with_hooks=use_hooks)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
