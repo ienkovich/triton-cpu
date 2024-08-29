@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List
 from . import language as tl
-from triton.compiler import CompiledKernel
+import triton
 
 
 class CPUDeviceInterface:
@@ -41,13 +41,13 @@ class CPUDeviceInterface:
         self.kernel_times = []
         self.last_start = 0
         self.use_hooks = False
-        CompiledKernel.launch_enter_hook = None
-        CompiledKernel.launch_exit_hook = None
+        triton.compiler.CompiledKernel.launch_enter_hook = None
+        triton.compiler.CompiledKernel.launch_exit_hook = None
 
     def enable_hook_timing(self):
         self.use_hooks = True
-        CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
-        CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
+        triton.compiler.CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
+        triton.compiler.CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
 
     def synchronize(self):
         pass

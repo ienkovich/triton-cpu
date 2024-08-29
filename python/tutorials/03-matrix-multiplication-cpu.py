@@ -216,12 +216,8 @@ def matmul_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
-
-        # TODO: Currently masked load is not supported yet.
-        # a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        # b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
         # Advance the ptrs to the next K block.
@@ -237,10 +233,8 @@ def matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
 
-    # TODO: Currently masked load is not supported yet.
-    # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    # tl.store(c_ptrs, c, mask=c_mask)
-    tl.store(c_ptrs, c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 # %%
@@ -388,7 +382,7 @@ def benchmark(M, N, K, provider):
                                                      device_type=device)
     elif provider == 'torch-cpu-compile':
         compiled = torch.compile(torch.matmul)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: compiled(a, b, out=c), quantiles=quantiles,
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: compiled(a, b), quantiles=quantiles,
                                                      device_type=device)
     elif provider == 'triton-cpu-single':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, c), quantiles=quantiles, device_type=device)
