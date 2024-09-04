@@ -24,7 +24,8 @@ import triton
 import triton.language as tl
 
 GPU_BLOCK_SIZE = 1024
-CPU_BLOCK_SIZE = 4096
+CPU_BLOCK_SIZE = 2048
+CPU_ST_TRESHOLD = 65536
 USE_GPU = False
 
 
@@ -100,11 +101,12 @@ def add(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor, device):
     # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].
     # In this case, we use a 1D grid where the size is the number of blocks:
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
+    BLOCK_SIZE = CPU_BLOCK_SIZE if device == 'cpu' else GPU_BLOCK_SIZE
     # NOTE:
     #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
     #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
     #  - Don't forget to pass meta-parameters as keywords arguments.
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE if device == 'cpu' else GPU_BLOCK_SIZE)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
     # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still
     # running asynchronously at this point.
     return output
@@ -116,6 +118,17 @@ def add_tiled(x: torch.Tensor, y: torch.Tensor, output):
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
     add_kernel_tiled[grid](x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE, TILE_SIZE=16)
+    return output
+
+def add_tiled_with_st_threshold(x: torch.Tensor, y: torch.Tensor, output):
+    if output is None:
+        output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
+    BLOCK_SIZE = triton.next_power_of_2(n_elements)
+    if BLOCK_SIZE > CPU_ST_TRESHOLD:
+        BLOCK_SIZE = CPU_BLOCK_SIZE
+    add_kernel_tiled[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, TILE_SIZE=16)
     return output
 
 
@@ -137,9 +150,17 @@ output_triton_cpu = add_tiled(x, y, None)
 print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
 
-LINE_VALS = ['triton-cpu', 'triton-cpu-hooks', 'triton-cpu-tiled', 'triton-cpu-tiled-hooks', 'torch-cpu']
-LINE_NAMES = ['TritonCPU', 'TritonCPU (hooks)', 'TritonCPUTiled', 'TritonCPUTiled (hooks)', 'TorchCPU']
-LINE_STYLES = [('blue', '--'), ('blue', '-'), ('blue', '-'), ('blue', '-'), ('green', '-')]
+LINE_VALS = [
+    'triton-cpu',
+    'triton-cpu-hooks',
+    #'triton-cpu-tiled',
+    'triton-cpu-tiled-hooks',
+    'triton-cpu-tiled-tuned-hooks',
+    'torch-cpu'
+]
+LINE_NAMES=LINE_VALS
+#LINE_NAMES = ['TritonCPU', 'TritonCPU (hooks)', 'TritonCPUTiled', 'TritonCPUTiled (hooks)', 'TorchCPU']
+LINE_STYLES = [('blue', '--'), ('blue', '-'), ('blue', '-'), ('blue', '-'), ('blue', '-'), ('green', '-')]
 
 if USE_GPU and triton.runtime.driver.get_active_gpus():
     triton.runtime.driver.set_active_to_gpu()
@@ -222,6 +243,9 @@ def benchmark(size, provider):
                                                      device_type=device)
     elif provider == 'triton-cpu-tiled-hooks':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add_tiled(x, y, output), quantiles=quantiles,
+                                                     device_type=device, measure_time_with_hooks=True)
+    elif provider == 'triton-cpu-tiled-tuned-hooks':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add_tiled_with_st_threshold(x, y, output), quantiles=quantiles,
                                                      device_type=device, measure_time_with_hooks=True)
     gbps = lambda ms: 3 * x.numel() * x.element_size() / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
