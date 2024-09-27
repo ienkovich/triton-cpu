@@ -154,8 +154,8 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_SIZE_M = 32
-BLOCK_SIZE_N = 32
+BLOCK_SIZE_M = 16
+BLOCK_SIZE_N = 16
 BLOCK_SIZE_K = 32
 GROUP_SIZE_M = 8
 USE_GPU = False
@@ -201,11 +201,20 @@ def matmul_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     # See above `Pointer Arithmetic` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    #offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    #offs_k = tl.arange(0, BLOCK_SIZE_K)
+    #a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    #b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    offs_m = pid_m * BLOCK_SIZE_M
+    offs_n = pid_n * BLOCK_SIZE_N
+    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(offs_m, 0),
+                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
+    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K, N), strides=(N, 1), offsets=(0, offs_n),
+                                    block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), order=(1, 0))
+    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(offs_m, offs_n),
+                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -220,27 +229,30 @@ def matmul_kernel(
         # TODO: Currently masked load is not supported yet.
         # a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         # b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        a = tl.load(a_block_ptr)
+        b = tl.load(b_block_ptr)
         # We accumulate along the K dimension.
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
         # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        #a_ptrs += BLOCK_SIZE_K * stride_ak
+        #b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
     # Convert the accumulator to the output matrix C's type if needed.
     c = accumulator
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    #offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    #offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    #c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
 
     # TODO: Currently masked load is not supported yet.
     # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     # tl.store(c_ptrs, c, mask=c_mask)
-    tl.store(c_ptrs, c)
+    #tl.store(c_ptrs, c)
+    tl.store(c_block_ptr, c)
 
 
 # %%
@@ -310,6 +322,7 @@ else:
 # but feel free to arrange this script as you wish to benchmark any other matrix shape.
 
 LINE_VALS = ['triton-cpu-single', 'triton-cpu', 'torch-cpu-native', 'torch-cpu-compile']
+#LINE_VALS = ['triton-cpu-single', 'triton-cpu']
 LINE_NAMES = ['TritonCPU 1', 'TritonCPU', 'TorchCPU (native)', 'TorchCPU (compile)']
 LINE_STYLES = [('blue', '--'), ('blue', '-'), ('green', '--'), ('green', '-')]
 
@@ -355,18 +368,21 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
         ylabel='GFLOPS',  # Label name for the y-axis.
         plot_name=
         # Name for the plot. Used also as a file name for saving the plot.
-        f'matmul-performance-fp32 (BLOCK_SIZE_M={BLOCK_SIZE_M}, BLOCK_SIZE_N={BLOCK_SIZE_N}, BLOCK_SIZE_K={BLOCK_SIZE_K}, GROUP_SIZE_M={GROUP_SIZE_M})',
+        f'matmul-performance-bf16 (BLOCK_SIZE_M={BLOCK_SIZE_M}, BLOCK_SIZE_N={BLOCK_SIZE_N}, BLOCK_SIZE_K={BLOCK_SIZE_K}, GROUP_SIZE_M={GROUP_SIZE_M})',
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(M, N, K, provider):
     import os
 
     device = 'cpu' if 'cpu' in provider else 'cuda'
-    a = torch.randn((M, K), device=device, dtype=torch.float32)
-    b = torch.randn((K, N), device=device, dtype=torch.float32)
+    a = torch.randn((M, K), device=device, dtype=torch.bfloat16)
+    b = torch.randn((K, N), device=device, dtype=torch.bfloat16)
 
     if device == 'cpu':
-        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        if 'triton' in provider:
+            c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
+        else:
+            c = torch.zeros((M, N), device=a.device, dtype=torch.bfloat16)
         triton.runtime.driver.set_active_to_cpu()
         if 'single' in provider:
             os.environ['TRITON_CPU_SINGLE_CORE'] = '1'
