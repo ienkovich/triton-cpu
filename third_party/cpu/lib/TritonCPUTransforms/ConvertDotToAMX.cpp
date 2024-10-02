@@ -414,7 +414,7 @@ Value getInitAccValue(Value val) {
   return forOp.getInitArgs()[initValIdx];
 }
 
-VectorType getSwizzledRhsTileType(VectorType origTileType) {
+template <typename T> T getSwizzledRhsTileType(T origTileType) {
   int64_t rowsPerGroup = 32 / origTileType.getElementTypeBitWidth();
   SmallVector<int64_t> shape({origTileType.getDimSize(0) / rowsPerGroup,
                               origTileType.getDimSize(1) * rowsPerGroup});
@@ -553,7 +553,7 @@ Value shiftIndex(Location loc, Value index, int64_t offs,
 }
 
 SmallVector<Value, 2> shiftIndices(Location loc, ArrayRef<Value> indices,
-                                   VectorType tileTy, int64_t tilesInBlockM,
+                                   amx::TileType tileTy, int64_t tilesInBlockM,
                                    int64_t tilesInBlockN, int64_t blockM,
                                    int64_t blockN, int64_t tileM, int64_t tileN,
                                    PatternRewriter &rewriter) {
@@ -565,7 +565,7 @@ SmallVector<Value, 2> shiftIndices(Location loc, ArrayRef<Value> indices,
           shiftIndex(loc, indices[1], tileOffsN, rewriter)};
 }
 
-Value loadTile(Location loc, VectorType tileTy, const AmxBuffer &buf,
+Value loadTile(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
                int64_t tilesInBlockM, int64_t tilesInBlockN, int64_t blockM,
                int64_t blockN, int64_t tileM, int64_t tileN,
                PatternRewriter &rewriter) {
@@ -575,10 +575,10 @@ Value loadTile(Location loc, VectorType tileTy, const AmxBuffer &buf,
   return rewriter.create<amx::TileLoadOp>(loc, tileTy, buf.memRef, indices);
 }
 
-void storeTile(Location loc, VectorType tileTy, Value val, const AmxBuffer &buf,
-               int64_t tilesInBlockM, int64_t tilesInBlockN, int64_t blockM,
-               int64_t blockN, int64_t tileM, int64_t tileN,
-               PatternRewriter &rewriter) {
+void storeTile(Location loc, amx::TileType tileTy, Value val,
+               const AmxBuffer &buf, int64_t tilesInBlockM,
+               int64_t tilesInBlockN, int64_t blockM, int64_t blockN,
+               int64_t tileM, int64_t tileN, PatternRewriter &rewriter) {
   auto indices =
       shiftIndices(loc, buf.indices, tileTy, tilesInBlockM, tilesInBlockN,
                    blockM, blockN, tileM, tileN, rewriter);
@@ -586,7 +586,7 @@ void storeTile(Location loc, VectorType tileTy, Value val, const AmxBuffer &buf,
 }
 
 SmallVector<SmallVector<Value>>
-loadBlockTiles(Location loc, VectorType tileTy, const AmxBuffer &buf,
+loadBlockTiles(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
                int64_t tilesInBlockM, int64_t tilesInBlockN, int64_t blockM,
                int64_t blockN, PatternRewriter &rewriter) {
   SmallVector<SmallVector<Value>> res(tilesInBlockM);
@@ -605,7 +605,7 @@ loadBlockTiles(Location loc, VectorType tileTy, const AmxBuffer &buf,
 // Move acc to a tile for the whole loop. It might be loads from memory or
 // zero tiles.
 SmallVector<SmallVector<Value>>
-moveLoopAccToTiles(Location loc, VectorType tileTy, const AmxBuffer &buf,
+moveLoopAccToTiles(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
                    int64_t tilesInBlockM, int64_t tilesInBlockN,
                    PatternRewriter &rewriter) {
   LDBG("Loading accumulator to tiles before the loop.");
@@ -623,8 +623,8 @@ moveLoopAccToTiles(Location loc, VectorType tileTy, const AmxBuffer &buf,
 // Multiply two blocks. LHS block is preloaded to tiles with the following
 // iteration over RHS. Accumulator values are updated in accTiles.
 // Optionally, results can also be stored to accBuf.
-void multiplyBlocksPreloadLhs(Location loc, VectorType lhsTileTy,
-                              VectorType rhsTileTy, VectorType accTileTy,
+void multiplyBlocksPreloadLhs(Location loc, amx::TileType lhsTileTy,
+                              amx::TileType rhsTileTy, amx::TileType accTileTy,
                               const AmxBuffer &lhsBuf, const AmxBuffer &rhsBuf,
                               const AmxBuffer &accBuf, int64_t blockM,
                               int64_t blockN, int64_t blockK,
@@ -659,8 +659,8 @@ void multiplyBlocksPreloadLhs(Location loc, VectorType lhsTileTy,
 }
 
 // Similar to multiplyBlocksPreloadLhs but here RHS is preloaded to tiles.
-void multiplyBlocksPreloadRhs(Location loc, VectorType lhsTileTy,
-                              VectorType rhsTileTy, VectorType accTileTy,
+void multiplyBlocksPreloadRhs(Location loc, amx::TileType lhsTileTy,
+                              amx::TileType rhsTileTy, amx::TileType accTileTy,
                               const AmxBuffer &lhsBuf, const AmxBuffer &rhsBuf,
                               const AmxBuffer &accBuf, int64_t blockM,
                               int64_t blockN, int64_t blockK,
@@ -702,15 +702,15 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
   VectorType rhsTy = cast<VectorType>(op.getRhs().getType());
   VectorType accTy = cast<VectorType>(op.getAcc().getType());
   VectorType resTy = cast<VectorType>(op.getResultType());
-  VectorType lhsTileTy =
-      lhsTy.cloneWith(SmallVector<int64_t>({candidate.tileM, candidate.tileK}),
-                      candidate.lhsTileElemTy);
-  VectorType rhsTileTy = getSwizzledRhsTileType(
-      rhsTy.cloneWith(SmallVector<int64_t>({candidate.tileK, candidate.tileN}),
-                      candidate.rhsTileElemTy));
-  VectorType accTileTy =
-      accTy.cloneWith(SmallVector<int64_t>({candidate.tileM, candidate.tileN}),
-                      candidate.accTileElemTy);
+  amx::TileType lhsTileTy = amx::TileType::get(
+      SmallVector<int64_t>({candidate.tileM, candidate.tileK}),
+      candidate.lhsTileElemTy);
+  amx::TileType rhsTileTy = getSwizzledRhsTileType(amx::TileType::get(
+      SmallVector<int64_t>({candidate.tileK, candidate.tileN}),
+      candidate.rhsTileElemTy));
+  amx::TileType accTileTy = amx::TileType::get(
+      SmallVector<int64_t>({candidate.tileM, candidate.tileN}),
+      candidate.accTileElemTy);
 
   // If we don't work with a loop and want to directly store tiles into output
   // memory, then use the original store as insertion point to have its buffer
