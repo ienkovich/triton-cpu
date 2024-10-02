@@ -221,7 +221,8 @@ struct ConvertMulSumToDotHorizontalSum
         // pair of adjacent bf16 elements in the source vectors (8 bf16), and
         // output 4 fp32 elements.
         auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, resultTypes, bfdotIntrinsic, args, LLVM::FastmathFlags::fast);
+            loc, resultTypes, bfdotIntrinsic, args, LLVM::FastmathFlags::fast,
+            ArrayRef<ValueRange>());
         outRes[outIdx] = callIntrOp.getResult(0);
       }
     }
@@ -237,7 +238,8 @@ struct ConvertMulSumToDotHorizontalSum
       // This horizontal sum intrinsic will sum all fp32 elements in the source
       // vector into a single fp32 element
       auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, resultTypes, horizSumIntrinsic, args, LLVM::FastmathFlags::fast);
+          loc, resultTypes, horizSumIntrinsic, args, LLVM::FastmathFlags::fast,
+          ArrayRef<ValueRange>());
       res = rewriter.create<vector::InsertOp>(loc, callIntrOp.getResult(0), res,
                                               outIdx);
     }
@@ -429,8 +431,8 @@ struct ConvertMulSumToDotPack
           // each pair of adjacent bf16 elements in the source vectors
           // (8 bf16), and output 4 fp32 elements.
           auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-              loc, resultTypes, bfdotIntrinsic, args,
-              LLVM::FastmathFlags::fast);
+              loc, resultTypes, bfdotIntrinsic, args, LLVM::FastmathFlags::fast,
+              ArrayRef<ValueRange>());
           subRes[outIdx] = callIntrOp.getResult(0);
         }
       }

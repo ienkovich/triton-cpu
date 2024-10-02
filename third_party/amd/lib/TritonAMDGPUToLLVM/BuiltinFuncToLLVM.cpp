@@ -190,7 +190,8 @@ private:
       auto name = StringAttr::get(callOp.getContext(), "llvm.amdgcn.rcp.f32");
       LLVM::FastmathFlagsAttr defaultFlags{};
       auto rcpOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, returnType, name, operands[1], defaultFlags);
+          loc, returnType, name, operands[1], defaultFlags,
+          ArrayRef<ValueRange>());
 
       replacementOp = rewriter.create<LLVM::FMulOp>(
           loc, returnType, operands[0], rcpOp->getResult(0), defaultFlags);

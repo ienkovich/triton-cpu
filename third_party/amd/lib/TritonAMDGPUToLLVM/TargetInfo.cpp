@@ -71,9 +71,11 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                          Value cmp) const {
   auto stringAttr = rewriter.getStringAttr("llvm.amdgcn.ballot");
   SmallVector<Value> operands = {cmp};
-  Value asmResult =
-      rewriter.create<LLVM::CallIntrinsicOp>(loc, type, stringAttr, operands)
-          ->getResult(0);
+  Value asmResult = rewriter
+                        .create<LLVM::CallIntrinsicOp>(
+                            loc, type, stringAttr, operands,
+                            LLVM::FastmathFlags::none, ArrayRef<ValueRange>())
+                        ->getResult(0);
   return asmResult;
 }
 
