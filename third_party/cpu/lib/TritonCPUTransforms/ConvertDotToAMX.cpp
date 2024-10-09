@@ -360,9 +360,10 @@ bool isAmxCandidate(vector::ContractionOp op, bool supportInt8,
   // Can't keep acc in a tile the whole loop right now:
   // https://github.com/llvm/llvm-project/issues/109481
   if (candidate.keepAccOnTiles) {
-    // We might not have enough tiles to hold accumulator. In this case
-    // keep it in a bufffer.
-    if (candidate.tilesInBlockM * candidate.tilesInBlockN > 1) {
+    // We might not have enough tiles to hold the whole accumulator. If we
+    // have more than one block, keep it in a bufffer.
+    if (candidate.tilesInBlockM * candidate.tileM < resTy.getDimSize(0) ||
+        candidate.tilesInBlockN * candidate.tileN < resTy.getDimSize(1)) {
       LDBG("Accumulator is too big to keep on tiles. Keep it bufferized "
            "insterad.");
       candidate.keepAccOnTiles = false;
@@ -370,14 +371,6 @@ bool isAmxCandidate(vector::ContractionOp op, bool supportInt8,
     } else {
       findOutputBuffer(getResValueForLoopCarriedAcc(op), candidate);
     }
-
-    // TODO: fix LLVM bug and remove this code.
-    LDBG("Avoid accumulator on tiles due to LLVM bug: "
-         "https://github.com/llvm/llvm-project/issues/109481.");
-    LDBG("Keep accumulator bufferized instead.");
-    candidate.keepAccOnTiles = false;
-    candidate.keepAccInBuf = true;
-    candidate.outBuf = AmxBuffer{};
   } else {
     findOutputBuffer(op.getResult(), candidate);
   }
@@ -602,22 +595,18 @@ loadBlockTiles(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
   return res;
 }
 
-// Move acc to a tile for the whole loop. It might be loads from memory or
-// zero tiles.
-SmallVector<SmallVector<Value>>
-moveLoopAccToTiles(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
-                   int64_t tilesInBlockM, int64_t tilesInBlockN,
-                   PatternRewriter &rewriter) {
-  LDBG("Loading accumulator to tiles before the loop.");
-  auto res = loadBlockTiles(loc, tileTy, buf, tilesInBlockM, tilesInBlockN, 0,
-                            0, rewriter);
-
-  // TODO: add new block args into ForOp and return them instead.
-  // Yield directly uses them for now and will be patched after mul
-  // ops generation.
-  llvm_unreachable("Not yet supported.");
-
-  return res;
+void storeBlockTiles(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
+                     int64_t blockM, int64_t blockN,
+                     const SmallVector<SmallVector<Value>> &tiles,
+                     PatternRewriter &rewriter) {
+  int64_t tilesInBlockM = tiles.size();
+  int64_t tilesInBlockN = tiles[0].size();
+  for (int64_t m = 0; m < tilesInBlockM; ++m) {
+    for (int64_t n = 0; n < tilesInBlockN; ++n) {
+      storeTile(loc, tileTy, tiles[m][n], buf, tilesInBlockM, tilesInBlockN,
+                blockM, blockN, m, n, rewriter);
+    }
+  }
 }
 
 // Multiply two blocks. LHS block is preloaded to tiles with the following
@@ -756,10 +745,20 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
       loc, op.getResult(), accBuf, candidate.outBuf, allocaPoint, rewriter);
 
   SmallVector<SmallVector<Value>> accTiles;
-  if (candidate.keepAccOnTiles)
-    accTiles =
-        moveLoopAccToTiles(loc, accTileTy, accBuf, candidate.tilesInBlockM,
-                           candidate.tilesInBlockN, rewriter);
+  SmallVector<SmallVector<Value>> accInitTiles;
+  if (candidate.keepAccOnTiles) {
+    // Initial tile values are loaded before the loop and then directly
+    // used within the loop. Later, new iter values will be added to
+    // add loop carried-dependencies for accumulator tiles and accInitTiles
+    // will be used as initializers for them.
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(forOp);
+    LDBG("Loading accumulator to tiles before the loop.");
+    accInitTiles =
+        loadBlockTiles(loc, accTileTy, accBuf, candidate.tilesInBlockM,
+                       candidate.tilesInBlockN, 0, 0, rewriter);
+    accTiles = accInitTiles;
+  }
 
   int64_t blocksInAccM =
       accTy.getDimSize(0) / candidate.tileM / candidate.tilesInBlockM;
@@ -797,15 +796,76 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
     }
   }
 
-  // TODO: For keepAccOnTiles fix YieldOp to use mul results.
-  // TODO: For keepAccOnTiles move all new forOp results to vector through a
-  // buffer.
-  if (candidate.keepAccOnTiles)
-    llvm_unreachable("Not yet supported.");
+  if (candidate.keepAccOnTiles) {
+    // In this case we have the whole accumulator/result on tiles. Loop
+    // carried dependencies are not in place yet and should be added.
+    // After the loop, resulting tiles should either be stored to the
+    // output buffer, or moved to a vector though a temporary buffer.
 
-  if (candidate.keepAccInBuf) {
-    int resIdx = op.getResult().getUses().begin()->getOperandNumber();
-    Value loopRes = forOp.getResult(resIdx);
+    // We don't need the original accumulator and contraction op anymore.
+    // Directly yield orig accumulator value, so it would be later removed
+    // as unused. The original contraction can be removed right away.
+    int64_t origResIdx = op.getResult().getUses().begin()->getOperandNumber();
+    rewriter.replaceOp(op, op.getAcc());
+
+    // Now, replace the loop with a new one to add loop carried dependency for
+    // accumulator tiles.
+    LDBG("Rewrite loop to introduce loop carried dependencies for accumulator "
+         "tiles.");
+    SmallVector<Value> newInitOperands;
+    SmallVector<Value> newYieldedValues;
+    for (int64_t m = 0; m < candidate.tilesInBlockM; ++m)
+      for (int64_t n = 0; n < candidate.tilesInBlockN; ++n) {
+        LDBG("Initial value\n  " << accInitTiles[m][n]
+                                 << "\nis cpombined with\n  "
+                                 << accTiles[m][n]);
+        newInitOperands.push_back(accInitTiles[m][n]);
+        newYieldedValues.push_back(accTiles[m][n]);
+      }
+    auto newForOp = cast<scf::ForOp>(*forOp.replaceWithAdditionalYields(
+        rewriter, newInitOperands, true,
+        [&newYieldedValues](OpBuilder &b, Location loc,
+                            ArrayRef<BlockArgument> newBBArgs) {
+          return newYieldedValues;
+        }));
+
+    // The resulting tiles are now in the new loop results.
+    auto resTiles = newForOp.getResults().take_back(newYieldedValues.size());
+    for (int64_t m = 0; m < candidate.tilesInBlockM; ++m)
+      for (int64_t n = 0; n < candidate.tilesInBlockN; ++n) {
+        accTiles[m][n] = resTiles[m * candidate.tilesInBlockN + n];
+      }
+
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointAfter(forOp);
+    if (candidate.outBuf.empty()) {
+      // Move tiles to a vector through a temporary buffer and use it instead
+      // of the original one.
+      LDBG("Moving resulting tiles to a vector through memory.");
+      VectorType resTy = accTy.cloneWith(std::nullopt, candidate.accTileElemTy);
+      if (accBuf.empty())
+        accBuf = allocateTmpBuffer(loc, resTy, allocaPoint, rewriter);
+      storeBlockTiles(loc, accTileTy, accBuf, 0, 0, accTiles, rewriter);
+      Value newVal = rewriter.create<vector::TransferReadOp>(
+          loc, resTy, resBuf.memRef, resBuf.indices);
+      // We might need to cast back to the original type.
+      newVal = maybeCast(loc, newVal, accTy.getElementType(), rewriter);
+      rewriter.replaceAllUsesWith(forOp.getResult(origResIdx), newVal);
+    } else {
+      // Store tiles directly to the output buffer and remove the original
+      // store.
+      LDBG("Storing  resulting tiles to the output memory.");
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPoint(candidate.origStore);
+      storeBlockTiles(loc, accTileTy, candidate.outBuf, 0, 0, accTiles,
+                      rewriter);
+      rewriter.eraseOp(candidate.origStore);
+    }
+  } else if (candidate.keepAccInBuf) {
+    // The result is in the buffer. We should load it and replace one of the
+    // loop results. The original contraction op can be removed.
+    // TODO: should we try to store to the output buffer on the last iteration?
+    Value loopRes = forOp.getTiedLoopResult(cast<BlockArgument>(op.getAcc()));
     LDBG(
         "Loading buffererized accumulator to a vector to replace loop result.");
     OpBuilder::InsertionGuard g(rewriter);
@@ -815,10 +875,12 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
     // We might need to cast back to the original type.
     newVal = maybeCast(loc, newVal, accTy.getElementType(), rewriter);
     rewriter.replaceAllUsesWith(loopRes, newVal);
-    // For now, just use init value for unused ForOp result instead of
-    // its removal.
+    // Directly yield orig accumulator iter value. It will be removed as unused
+    // later.
     rewriter.replaceOp(op, op.getAcc());
   } else if (candidate.outBuf.empty()) {
+    // The result is in the buffer. We should load it and replace the original
+    // constraction result.
     LDBG("Loading the result to a vector to replace orig op result.");
     Value newVal = rewriter.create<vector::TransferReadOp>(
         loc, cast<VectorType>(acc.getType()), resBuf.memRef, resBuf.indices);
@@ -826,8 +888,10 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
     newVal = maybeCast(loc, newVal, accTy.getElementType(), rewriter);
     rewriter.replaceOp(op, newVal);
   } else {
+    // The result is already in the output buffer. We just need to remove the
+    // original contraction and store operation.
     LDBG("Removing original operation and its use.");
-    rewriter.eraseOp(*op.getResult().user_begin());
+    rewriter.eraseOp(candidate.origStore);
     rewriter.eraseOp(op);
   }
 
