@@ -73,8 +73,16 @@ public:
     auto bTy = cast<TensorOrMemDesc>(op->getOperand(1).getType());
     auto cTy = cast<TensorOrMemDesc>(op->getOperand(2).getType());
     auto aShape = aTy.getShape();
-    auto bShape = bTy.getShape();
+    SmallVector<int64_t> bShape{bTy.getShape()};
     auto cShape = cTy.getShape();
+    if (auto attr = dyn_cast_or_null<triton::InputEncodingAttr>(
+            op->getAttr("rhsEncoding"))) {
+      if (attr.getValue() == triton::InputEncoding::RowMajorInterleaved) {
+        int64_t scale = 32 / bTy.getElementTypeBitWidth();
+        bShape[0] *= scale;
+        bShape[1] /= scale;
+      }
+    }
     // Check if all 3d or all 2d
     if (aShape.size() != 2 && aShape.size() != 3)
       return op->emitOpError("expected operands to be 2d or 3d");

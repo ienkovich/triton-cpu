@@ -36,6 +36,7 @@ class CPUOptions:
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e5b16", "fp8e4nv")
     deprecated_fp8_dtypes: Tuple[str] = ()
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "tf32", "tf32x3")
+    allowed_dot_input_encodings: Tuple[Tuple[str]] = (("row_major", "row_major"), ("row_major", "row_major_interleaved"))
     allow_fp8e4nv: bool = True
     allow_fp8e4b15: bool = True
     enable_fp_fusion: bool = True
@@ -165,7 +166,8 @@ class CPUBackend(BaseBackend):
             # FP16 support is not in AMX dialect yet
             amx_fp16 = False
             amx_bf16 = 'amx-bf16' in self.cpu_features
-            cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
+            #cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
+        cpu.passes.ttcpuir.add_convert_dot_generic(pm)
         promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
         # We don't have any lowering for mixed precision matmuls, so always use casts for now
         convert_mixed_precision_matmul = True

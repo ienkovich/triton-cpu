@@ -1,4 +1,4 @@
-#include "triton/Dialect/Triton/IR/Traits.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <numeric>
 
