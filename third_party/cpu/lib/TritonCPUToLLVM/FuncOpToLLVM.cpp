@@ -217,6 +217,12 @@ private:
     auto newCallOp = rewriter.create<LLVM::CallOp>(
         callOp.getLoc(), packedResult ? TypeRange(packedResult) : TypeRange(),
         promotedOperands, callOp->getAttrs());
+    // Used builder creates wrong operandSegmentSizes and doesn't add
+    // op_bundle_sizes attr.
+    newCallOp.getProperties().operandSegmentSizes[0] =
+        static_cast<int32_t>(promotedOperands.size());
+    newCallOp.getProperties().setOpBundleSizes(
+        rewriter.getDenseI32ArrayAttr({}));
     return newCallOp;
   }
 
