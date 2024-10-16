@@ -225,11 +225,11 @@ Value getResValueForLoopCarriedAcc(cpu::DotOp op) {
 // by input shapes and types. Block sizes are chosen to minimize number of
 // tile loads/stores including tile register spills.
 void setupBlockAndTileSizes(ArrayRef<int64_t> lhsShape,
-                            ArrayRef<int64_t> rhsShape,
+                            ArrayRef<int64_t> resShape,
                             AmxDotOpCandidate &candidate) {
-  int64_t m = lhsShape[0];
-  int64_t n = rhsShape[1];
-  int64_t k = rhsShape[0];
+  int64_t m = resShape[0];
+  int64_t n = resShape[1];
+  int64_t k = lhsShape[1];
   int64_t tileM = std::min(m, (int64_t)16);
   int64_t tileN = std::min(n, (int64_t)16);
   int64_t tileK = std::min(
@@ -308,7 +308,7 @@ bool isAmxCandidate(cpu::DotOp op, bool supportInt8, bool supportFp16,
     return false;
 
   candidate.op = op;
-  setupBlockAndTileSizes(lhsTy.getShape(), rhsTy.getShape(), candidate);
+  setupBlockAndTileSizes(lhsTy.getShape(), resTy.getShape(), candidate);
   candidate.keepAccOnTiles = isLoopCarriedAcc(op.getC());
 
   // Can't keep acc in a tile the whole loop right now:
