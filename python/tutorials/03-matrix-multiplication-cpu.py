@@ -384,10 +384,17 @@ def matmul_kernel_amx_interleaved_blocked(
     offs_m = block_m * BLOCK_SIZE_M
     offs_n = block_n * BLOCK_SIZE_N
 
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(offs_m, 0),
+    #a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(offs_m, 0),
+    #                                block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
+    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M * K // BLOCK_SIZE_K, BLOCK_SIZE_K), strides=(BLOCK_SIZE_K, 1),
+                                    offsets=(block_m * BLOCK_SIZE_M * (K // BLOCK_SIZE_K), 0),
                                     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
     b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K * N // BLOCK_SIZE_N // 2, BLOCK_SIZE_N * 2),
-                                    strides=(BLOCK_SIZE_N * 2, 1), offsets=((BLOCK_SIZE_K // 2) * block_n * (N // BLOCK_SIZE_N), 0),
+                                    strides=(BLOCK_SIZE_N * 2, 1),
+                                    # B blocks are in transposed order. To move by one block in N dimension
+                                    # we need to skip BLOCK_SIZE_N former columns which are now K / 2 of
+                                    # rows.
+                                    offsets=(block_n * K // 2, 0),
                                     block_shape=(BLOCK_SIZE_K // 2, BLOCK_SIZE_N * 2), order=(1, 0))
     c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(offs_m, offs_n),
                                     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
@@ -399,7 +406,8 @@ def matmul_kernel_amx_interleaved_blocked(
 
         c += tl.dot(a, b, out_dtype=tl.float32, rhs_encoding="row_major_interleaved")
 
-        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        #a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        a_block_ptr = tl.advance(a_block_ptr, (BLOCK_SIZE_M, 0))
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K // 2, 0))
 
     tl.store(c_block_ptr, c)
@@ -419,6 +427,21 @@ def interleave_blocked_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
         row2 = tl.load(in_p + BLOCK_IN_OFFS + N * (i * 2 + 1) + tl.arange(0, BLOCK_SIZE_N))
         joined = tl.reshape(tl.join(row1, row2), (2 * BLOCK_SIZE_N,))
         tl.store(out_p + BLOCK_OUT_OFFS + i * BLOCK_SIZE_N * 2 + tl.arange(0, BLOCK_SIZE_N * 2), joined)
+
+
+@triton.jit
+def blocked_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
+                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    tl.static_assert(M % BLOCK_SIZE_M == 0)
+    tl.static_assert(N % BLOCK_SIZE_N == 0)
+    BLOCKS_N = N // BLOCK_SIZE_N
+    m = tl.program_id(0) // BLOCKS_N
+    n = tl.program_id(0) % BLOCKS_N
+    BLOCK_IN_OFFS = m * BLOCK_SIZE_M * N + n * BLOCK_SIZE_N
+    BLOCK_OUT_OFFS = tl.program_id(0) * BLOCK_SIZE_M * BLOCK_SIZE_N
+    for i in tl.range(0, BLOCK_SIZE_M):
+        row = tl.load(in_p + BLOCK_IN_OFFS + N * i + tl.arange(0, BLOCK_SIZE_N))
+        tl.store(out_p + BLOCK_OUT_OFFS + BLOCK_SIZE_N * i + tl.arange(0, BLOCK_SIZE_N), row)
 
 
 def matmul_amx_interleaved_blocked(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
@@ -476,7 +499,9 @@ else:
           f'{torch.max(torch.abs(triton_output - torch_output))}')
 bib = torch.empty((256, 1024), dtype=torch.bfloat16, device='cpu')
 interleave_blocked_kernel[((512 // BLOCK_SIZE_K) * (512 // BLOCK_SIZE_N),)](b, bib, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N)
-triton_output = matmul_amx_interleaved_blocked(a, bib, None)
+ab = torch.empty((512, 512), dtype=torch.bfloat16, device='cpu')
+blocked_kernel[((512 // BLOCK_SIZE_M) * (512 // BLOCK_SIZE_K),)](a, ab, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_K)
+triton_output = matmul_amx_interleaved_blocked(ab, bib, None)
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
     print("✅ TritonCPU AMX blocked and TorchCPU match")
 else:
@@ -558,6 +583,9 @@ def benchmark(M, N, K, provider):
                 bib = torch.empty((K //2, N * 2), dtype=torch.bfloat16, device=device)
                 interleave_blocked_kernel[((K // BLOCK_SIZE_K) * (N // BLOCK_SIZE_N),)](b, bib, K, N, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N)
                 b = bib
+                ab = torch.empty((M, K), dtype=torch.bfloat16, device='cpu')
+                blocked_kernel[((M // BLOCK_SIZE_M) * (K // BLOCK_SIZE_K),)](a, ab, M, K, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_K)
+                a = ab
             elif 'prepack' in provider:
                 bi = torch.empty((K //2, N * 2), dtype=torch.bfloat16, device=device)
                 interleave_kernel[(1,)](b, bi, K, N, BLOCK_SIZE=64)
