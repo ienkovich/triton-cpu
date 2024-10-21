@@ -774,8 +774,7 @@ LogicalResult convertCandidate(AmxDotOpCandidate &candidate,
     for (int64_t m = 0; m < candidate.tilesInBlockM; ++m)
       for (int64_t n = 0; n < candidate.tilesInBlockN; ++n) {
         LDBG("Initial value\n  " << accInitTiles[m][n]
-                                 << "\nis cpombined with\n  "
-                                 << accTiles[m][n]);
+                                 << "\nis combined with\n  " << accTiles[m][n]);
         newInitOperands.push_back(accInitTiles[m][n]);
         newYieldedValues.push_back(accTiles[m][n]);
       }
