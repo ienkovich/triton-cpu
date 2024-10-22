@@ -1,4 +1,5 @@
 add_triton_library(TritonCPUTransforms
+    Canonicalize.cpp
     ConvertDotGeneric.cpp
     ConvertDotProduct.cpp
     ConvertDotToAMX.cpp
