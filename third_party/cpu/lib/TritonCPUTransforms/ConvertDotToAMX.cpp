@@ -37,7 +37,7 @@ namespace {
 // This struct describes buffers used to load/store AMX tiles.
 struct AmxBuffer {
   Value memRef;
-  SmallVector<Value, 2> indices;
+  SmallVector<Value> indices;
 
   bool empty() const { return !memRef; }
 };
@@ -376,7 +376,7 @@ AmxBuffer allocateTmpBuffer(Location loc, VectorType vecTy,
   Value memRef = rewriter.create<memref::AllocaOp>(
       loc, memRefTy, rewriter.getIntegerAttr(rewriter.getI64Type(), 64));
   Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-  SmallVector<Value, 2> indices(2, zeroIdx);
+  SmallVector<Value> indices(2, zeroIdx);
   return {memRef, indices};
 }
 
@@ -499,17 +499,19 @@ Value shiftIndex(Location loc, Value index, int64_t offs,
   return rewriter.create<arith::AddIOp>(loc, index.getType(), index, offsVal);
 }
 
-SmallVector<Value, 2> shiftIndices(Location loc, ArrayRef<Value> indices,
-                                   amx::TileType tileTy, int64_t tilesInBlockM,
-                                   int64_t tilesInBlockN, int64_t blockM,
-                                   int64_t blockN, int64_t tileM, int64_t tileN,
-                                   PatternRewriter &rewriter) {
+SmallVector<Value> shiftIndices(Location loc, ArrayRef<Value> indices,
+                                amx::TileType tileTy, int64_t tilesInBlockM,
+                                int64_t tilesInBlockN, int64_t blockM,
+                                int64_t blockN, int64_t tileM, int64_t tileN,
+                                PatternRewriter &rewriter) {
   int64_t blockOffsM = blockM * tilesInBlockM * tileTy.getDimSize(0);
   int64_t blockOffsN = blockN * tilesInBlockN * tileTy.getDimSize(1);
   int64_t tileOffsM = blockOffsM + tileM * tileTy.getDimSize(0);
   int64_t tileOffsN = blockOffsN + tileN * tileTy.getDimSize(1);
-  return {shiftIndex(loc, indices[0], tileOffsM, rewriter),
-          shiftIndex(loc, indices[1], tileOffsN, rewriter)};
+  SmallVector<Value> res(indices.begin(), indices.end() - 2);
+  res.push_back(shiftIndex(loc, *(indices.end() - 2), tileOffsM, rewriter));
+  res.push_back(shiftIndex(loc, *(indices.end() - 1), tileOffsN, rewriter));
+  return res;
 }
 
 Value loadTile(Location loc, amx::TileType tileTy, const AmxBuffer &buf,
