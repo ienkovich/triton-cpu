@@ -1432,7 +1432,8 @@ def _str_to_dot_input_encoding(input_encoding, builder):
 
 
 def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
-        out_dtype: tl.dtype, lhs_encoding: Optional[str], rhs_encoding: Optional[str], builder: ir.builder) -> tl.tensor:
+        out_dtype: tl.dtype, lhs_encoding: Optional[str], rhs_encoding: Optional[str],
+        builder: ir.builder) -> tl.tensor:
     assert lhs.type.is_block() and rhs.type.is_block()
 
     if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
@@ -1515,8 +1516,9 @@ def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optiona
         if lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and max_num_imprecise_acc > K:
             raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
 
-    return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, lhs_encoding, rhs_encoding, max_num_imprecise_acc),
-                     ret_ty)
+    return tl.tensor(
+        builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, lhs_encoding, rhs_encoding,
+                           max_num_imprecise_acc), ret_ty)
 
 
 # ===----------------------------------------------------------------------===//

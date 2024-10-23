@@ -1539,7 +1539,8 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     max_num_imprecise_acc = _constexpr_to_value(max_num_imprecise_acc)
     lhs_encoding = _constexpr_to_value(lhs_encoding)
     rhs_encoding = _constexpr_to_value(rhs_encoding)
-    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, lhs_encoding, rhs_encoding, _builder)
+    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, lhs_encoding,
+                        rhs_encoding, _builder)
 
 
 # -----------------------
