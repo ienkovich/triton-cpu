@@ -288,192 +288,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
     )
     return c
 
-@triton.jit
-def matmul_kernel_amx_interleaved(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-        # number of blocks in a group
-        GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    group_id = pid // (GROUP_SIZE_M * GROUP_SIZE_N)
-    groups_n = N // BLOCK_SIZE_N // GROUP_SIZE_N
-    group_m = group_id // groups_n
-    group_n = group_id % groups_n
-    block_id = pid % (GROUP_SIZE_M * GROUP_SIZE_N)
-    block_m = block_id // GROUP_SIZE_N
-    block_n = block_id % GROUP_SIZE_N
-
-    offs_m = (group_m * GROUP_SIZE_M + block_m) * BLOCK_SIZE_M
-    offs_n = (group_n * GROUP_SIZE_N + block_n) * BLOCK_SIZE_N
-
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(offs_m, 0),
-                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
-    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K // 2, N * 2), strides=(N * 2, 1), offsets=(0, offs_n * 2),
-                                    block_shape=(BLOCK_SIZE_K // 2, BLOCK_SIZE_N * 2), order=(1, 0))
-    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(offs_m, offs_n),
-                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
-
-    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_block_ptr)
-        b = tl.load(b_block_ptr)
-
-        c += tl.dot(a, b, out_dtype=tl.float32, rhs_encoding="row_major_interleaved")
-
-        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K // 2, 0))
-
-    tl.store(c_block_ptr, c)
-
 
 @triton.jit
-def interleave_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-    tl.static_assert(N % BLOCK_SIZE == 0)
-    for i in tl.range(0, tl.cdiv(M, 2)):
-        for j in tl.range(0, tl.cdiv(N, BLOCK_SIZE)):
-            row1 = tl.load(in_p + N * i * 2 + j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))
-            row2 = tl.load(in_p + N * (i * 2 + 1) + j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))
-            joined = tl.reshape(tl.join(row1, row2), (2 * BLOCK_SIZE, ))
-            tl.store(out_p + N * i * 2 + j * BLOCK_SIZE * 2 + tl.arange(0, BLOCK_SIZE * 2), joined)
-
-
-def matmul_amx_interleaved(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0] * 2, "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
-    M, K = a.shape
-    N = b.shape[1] // 2
-    #TODO: Currently masked load is not supported yet.
-    assert (M % (BLOCK_SIZE_M * GROUP_SIZE_M) == 0) and (N % (BLOCK_SIZE_N * GROUP_SIZE_N) == 0) and (
-        K % BLOCK_SIZE_K == 0), "Masking currently not supported, Matrix dimensions must be multiples of block size"
-    if c is None:
-        # Allocates output.
-        c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
-    else:
-        assert c.shape == (M, N), "Incompatible dimensions"
-    # 1D launch kernel where each block gets its own program.
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N), )
-    matmul_kernel_amx_interleaved[grid](
-        a, b, c,  #
-        M, N, K,  #
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,  #
-        GROUP_SIZE_M=GROUP_SIZE_M, GROUP_SIZE_N=GROUP_SIZE_N,#
-    )
-    return c
-
-
-@triton.jit
-def matmul_kernel_amx_interleaved_blocked(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-        # number of blocks in a group
-        GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    group_id = pid // (GROUP_SIZE_M * GROUP_SIZE_N)
-    groups_n = N // BLOCK_SIZE_N // GROUP_SIZE_N
-    group_m = group_id // groups_n
-    group_n = group_id % groups_n
-    block_id = pid % (GROUP_SIZE_M * GROUP_SIZE_N)
-    block_m = group_m * GROUP_SIZE_M + block_id // GROUP_SIZE_N
-    block_n = group_n * GROUP_SIZE_N + block_id % GROUP_SIZE_N
-
-    offs_m = block_m * BLOCK_SIZE_M
-    offs_n = block_n * BLOCK_SIZE_N
-
-    #a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(offs_m, 0),
-    #                                block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M * K // BLOCK_SIZE_K, BLOCK_SIZE_K), strides=(BLOCK_SIZE_K, 1),
-                                    offsets=(block_m * BLOCK_SIZE_M * (K // BLOCK_SIZE_K), 0),
-                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0))
-    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K * N // BLOCK_SIZE_N // 2, BLOCK_SIZE_N * 2),
-                                    strides=(BLOCK_SIZE_N * 2, 1),
-                                    # B blocks are in transposed order. To move by one block in N dimension
-                                    # we need to skip BLOCK_SIZE_N former columns which are now K / 2 of
-                                    # rows.
-                                    offsets=(block_n * K // 2, 0),
-                                    block_shape=(BLOCK_SIZE_K // 2, BLOCK_SIZE_N * 2), order=(1, 0))
-    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(offs_m, offs_n),
-                                    block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
-
-    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_block_ptr)
-        b = tl.load(b_block_ptr)
-
-        c += tl.dot(a, b, out_dtype=tl.float32, rhs_encoding="row_major_interleaved")
-
-        #a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-        a_block_ptr = tl.advance(a_block_ptr, (BLOCK_SIZE_M, 0))
-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K // 2, 0))
-
-    tl.store(c_block_ptr, c)
-
-@triton.jit
-def interleave_blocked_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
-                              BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
-    tl.static_assert(M % BLOCK_SIZE_M == 0)
-    tl.static_assert(N % BLOCK_SIZE_N == 0)
-    BLOCKS_N = N // BLOCK_SIZE_N
-    m = tl.program_id(0) // BLOCKS_N
-    n = tl.program_id(0) % BLOCKS_N
-    BLOCK_IN_OFFS = m * BLOCK_SIZE_M * N + n * BLOCK_SIZE_N
-    BLOCK_OUT_OFFS = m * BLOCK_SIZE_M * BLOCK_SIZE_N + n * BLOCK_SIZE_N * M
-    for i in tl.range(0, BLOCK_SIZE_M // 2):
-        row1 = tl.load(in_p + BLOCK_IN_OFFS + N * i * 2 + tl.arange(0, BLOCK_SIZE_N))
-        row2 = tl.load(in_p + BLOCK_IN_OFFS + N * (i * 2 + 1) + tl.arange(0, BLOCK_SIZE_N))
-        joined = tl.reshape(tl.join(row1, row2), (2 * BLOCK_SIZE_N,))
-        tl.store(out_p + BLOCK_OUT_OFFS + i * BLOCK_SIZE_N * 2 + tl.arange(0, BLOCK_SIZE_N * 2), joined)
-
-
-@triton.jit
-def blocked_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
-                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
-    tl.static_assert(M % BLOCK_SIZE_M == 0)
-    tl.static_assert(N % BLOCK_SIZE_N == 0)
-    BLOCKS_N = N // BLOCK_SIZE_N
-    m = tl.program_id(0) // BLOCKS_N
-    n = tl.program_id(0) % BLOCKS_N
-    BLOCK_IN_OFFS = m * BLOCK_SIZE_M * N + n * BLOCK_SIZE_N
-    BLOCK_OUT_OFFS = tl.program_id(0) * BLOCK_SIZE_M * BLOCK_SIZE_N
-    for i in tl.range(0, BLOCK_SIZE_M):
-        row = tl.load(in_p + BLOCK_IN_OFFS + N * i + tl.arange(0, BLOCK_SIZE_N))
-        tl.store(out_p + BLOCK_OUT_OFFS + BLOCK_SIZE_N * i + tl.arange(0, BLOCK_SIZE_N), row)
-
-
-def matmul_amx_interleaved_blocked(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0] * 2, "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
-    M, K = a.shape
-    N = b.shape[1] // 2
-    #print((M, N, K))
-    #TODO: Currently masked load is not supported yet.
-    assert (M % (BLOCK_SIZE_M * GROUP_SIZE_M) == 0) and (N % (BLOCK_SIZE_N * GROUP_SIZE_N) == 0) and (
-        K % BLOCK_SIZE_K == 0), "Masking currently not supported, Matrix dimensions must be multiples of block size"
-    if c is None:
-        # Allocates output.
-        c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
-    else:
-        assert c.shape == (M, N), "Incompatible dimensions"
-    # 1D launch kernel where each block gets its own program.
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N), )
-    matmul_kernel_amx_interleaved_blocked[grid](
-        a, b, c,  #
-        M, N, K,  #
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,  #
-        GROUP_SIZE_M=GROUP_SIZE_M, GROUP_SIZE_N=GROUP_SIZE_N,#
-    )
-    return c
-
-
-@triton.jit
-def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
-                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                   BLOCKED_OUTPUT: tl.constexpr, TRANSPOSE: tl.constexpr,
+def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                   BLOCK_SIZE_N: tl.constexpr, BLOCKED_OUTPUT: tl.constexpr, TRANSPOSE: tl.constexpr,
                    PACK32: tl.constexpr):
     B_PACK_SCALE: tl.constexpr = 32 // in_p.type.element_ty.primitive_bitwidth if PACK32 else 1
     tl.static_assert(B_PACK_SCALE >= 1 and B_PACK_SCALE <= 4)
@@ -505,15 +323,11 @@ def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
 
 
 @triton.jit
-def matmul_kernel_amx(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-        # number of blocks in a group
-        GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr,
-        BLOCKED_A: tl.constexpr, BLOCKED_B: tl.constexpr,
-        TRANSPOSED_B: tl.constexpr, PACKED_B: tl.constexpr
-):
+def matmul_kernel_amx(a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                      BLOCK_SIZE_K: tl.constexpr,
+                      # number of blocks in a group
+                      GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr, BLOCKED_A: tl.constexpr,
+                      BLOCKED_B: tl.constexpr, TRANSPOSED_B: tl.constexpr, PACKED_B: tl.constexpr):
     pid = tl.program_id(axis=0)
     group_id = pid // (GROUP_SIZE_M * GROUP_SIZE_N)
     groups_n = N // BLOCK_SIZE_N // GROUP_SIZE_N
@@ -541,13 +355,17 @@ def matmul_kernel_amx(
         b_stride_block_n = BLOCK_SIZE_K * BLOCK_SIZE_N if BLOCKED_B else PACKED_BLOCK_SIZE_N
         b_stride_block_k = BLOCK_SIZE_K * N
 
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K, BLOCK_SIZE_M, BLOCK_SIZE_K),
-                                    strides=(a_stride_block_m, a_stride_block_k, a_stride_m, a_stride_k), offsets=(block_m, 0, 0, 0),
-                                    block_shape=(1, 1, BLOCK_SIZE_M, BLOCK_SIZE_K), order=(3, 2, 1, 0))
-    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N),
-                                    strides=(b_stride_block_k, b_stride_block_n, b_stride_k, b_stride_n), offsets=(0, block_n, 0, 0),
-                                    block_shape=(1, 1, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N), order=(3, 2, 1, 0))
-    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(block_m * BLOCK_SIZE_M, block_n * BLOCK_SIZE_N),
+    a_block_ptr = tl.make_block_ptr(base=a_ptr,
+                                    shape=(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K, BLOCK_SIZE_M, BLOCK_SIZE_K),
+                                    strides=(a_stride_block_m, a_stride_block_k, a_stride_m, a_stride_k),
+                                    offsets=(block_m, 0, 0, 0), block_shape=(1, 1, BLOCK_SIZE_M, BLOCK_SIZE_K),
+                                    order=(3, 2, 1, 0))
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr, shape=(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N),
+        strides=(b_stride_block_k, b_stride_block_n, b_stride_k, b_stride_n), offsets=(0, block_n, 0, 0),
+        block_shape=(1, 1, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N), order=(3, 2, 1, 0))
+    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1),
+                                    offsets=(block_m * BLOCK_SIZE_M, block_n * BLOCK_SIZE_N),
                                     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
 
     c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -569,21 +387,15 @@ def matmul_amx(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, BLOCKED_A, BLO
     #TODO: Currently masked load is not supported yet.
     assert (M % (BLOCK_SIZE_M * GROUP_SIZE_M) == 0) and (N % (BLOCK_SIZE_N * GROUP_SIZE_N) == 0) and (
         K % BLOCK_SIZE_K == 0), "Masking currently not supported, Matrix dimensions must be multiples of block size"
-    if c is None:
-        # Allocates output.
-        c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
-    else:
-        assert c.shape == (M, N), "Incompatible dimensions"
     # 1D launch kernel where each block gets its own program.
-    grid = ((M // BLOCK_SIZE_M) * (N // BLOCK_SIZE_N),)
+    grid = ((M // BLOCK_SIZE_M) * (N // BLOCK_SIZE_N), )
     matmul_kernel_amx[grid](
         a, b, c,  #
         M, N, K,  #
         BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,  #
         GROUP_SIZE_M=GROUP_SIZE_M, GROUP_SIZE_N=GROUP_SIZE_N,  #
         BLOCKED_A=BLOCKED_A, BLOCKED_B=BLOCKED_B,  #
-        TRANSPOSED_B=TRANSPOSED_B, PACKED_B=PACKED_B
-    )
+        TRANSPOSED_B=TRANSPOSED_B, PACKED_B=PACKED_B)
     return c
 
 
@@ -592,39 +404,37 @@ def matmul_amx(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, BLOCKED_A, BLO
 # ---------
 #
 # We can test our custom matrix multiplication operation against a native torch implementation.
-
 torch.manual_seed(0)
 
 triton.runtime.driver.set_active_to_cpu()
 
 a = torch.randn((512, 512), device='cpu', dtype=torch.bfloat16)
 b = torch.randn((512, 512), device='cpu', dtype=torch.bfloat16)
-triton_output = matmul(a, b, None)
+c = torch.empty((512, 512), device='cpu', dtype=torch.float32)
 torch_output = torch.matmul(a.to(torch.float32), b.to(torch.float32))
 rtol = 0
+triton_output = matmul_amx(a, b, c, False, False, False, False)
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
     print("✅ TritonCPU and TorchCPU match")
 else:
     print("❌ TritonCPU and TorchCPU differ, the maximum difference is "
           f'{torch.max(torch.abs(triton_output - torch_output))}')
-bi = torch.empty((256, 1024), dtype=torch.bfloat16, device='cpu')
-interleave_kernel[(1,)](b, bi, 512, 512, BLOCK_SIZE=64)
-triton_output = matmul_amx_interleaved(a, bi, None)
+    assert False
+ab = torch.empty_like(a)
+prepack_kernel[(512 // BLOCK_SIZE_M, 521 // BLOCK_SIZE_K)](a, ab, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                                           BLOCK_SIZE_N=BLOCK_SIZE_K, BLOCKED_OUTPUT=True,
+                                                           TRANSPOSE=False, PACK32=False)
+bb = torch.empty_like(b)
+prepack_kernel[(512 // BLOCK_SIZE_K, 512 // BLOCK_SIZE_N)](b, bb, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_K,
+                                                           BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCKED_OUTPUT=True,
+                                                           TRANSPOSE=True, PACK32=True)
+triton_output = matmul_amx(ab, bb, c, True, True, True, True)
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
-    print("✅ TritonCPU AMX and TorchCPU match")
+    print("✅ TritonCPU pre-packed and TorchCPU match")
 else:
-    print("❌ TritonCPU AMX and TorchCPU differ, the maximum difference is "
+    print("❌ TritonCPU pre-packed and TorchCPU differ, the maximum difference is "
           f'{torch.max(torch.abs(triton_output - torch_output))}')
-bib = torch.empty((256, 1024), dtype=torch.bfloat16, device='cpu')
-interleave_blocked_kernel[((512 // BLOCK_SIZE_K) * (512 // BLOCK_SIZE_N),)](b, bib, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N)
-ab = torch.empty((512, 512), dtype=torch.bfloat16, device='cpu')
-blocked_kernel[((512 // BLOCK_SIZE_M) * (512 // BLOCK_SIZE_K),)](a, ab, 512, 512, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_K)
-triton_output = matmul_amx_interleaved_blocked(ab, bib, None)
-if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
-    print("✅ TritonCPU AMX blocked and TorchCPU match")
-else:
-    print("❌ TritonCPU AMX blocked and TorchCPU differ, the maximum difference is "
-          f'{torch.max(torch.abs(triton_output - torch_output))}')
+    assert False
 
 # %%
 # Benchmark
@@ -636,13 +446,17 @@ else:
 # We can now compare the performance of our kernel against that of Pytorch. Here we focus on square matrices,
 # but feel free to arrange this script as you wish to benchmark any other matrix shape.
 
-LINE_VALS = ['triton-cpu-single', 'triton-cpu', 'triton-cpu-prepack-single', 'triton-cpu-prepack', 'triton-cpu-prepack-blocked-single', 'triton-cpu-prepack-blocked', 'torch-cpu-native', 'torch-cpu-compile']
-#LINE_VALS = ['triton-cpu-single', 'triton-cpu']
-LINE_NAMES = ['TritonCPU 1', 'TritonCPU', 'TritonCPU Prepack 1', 'TritonCPU Prepack', 'TritonCPU Prepack Blocked 1', 'TritonCPU Prepack Blocked', 'TorchCPU (native)', 'TorchCPU (compile)']
-LINE_STYLES = [('blue', '--'), ('blue', '-'), ('blue', '--'), ('blue', '-'), ('blue', '--'), ('blue', '-'), ('green', '--'), ('green', '-')]
+LINE_VALS = ['triton-cpu-single', 'triton-cpu', 'torch-cpu-native', 'torch-cpu-compile']
+LINE_NAMES = ['TritonCPU 1', 'TritonCPU', 'TorchCPU (native)', 'TorchCPU (compile)']
+LINE_STYLES = [('blue', '--'), ('blue', '-'), ('blue', '--'), ('blue', '-'), ('blue', '--'), ('blue', '-'),
+               ('green', '--'), ('green', '-')]
 
-AMX_OPTS = ['nopack', 'pack32', 'blockeda', 'blockedb', 'blockeda-blockedb', 'blockeda-blockedb-transposedb', 'blockeda-blockedb-pack32', 'blockeda-blockedb-transposedb-pack32']
-LINE_VALS = [f'triton-cpu-{opt}{prefix}' for prefix in ['-single', ''] for opt in AMX_OPTS] + ['torch-cpu-native']
+AMX_OPTS = [
+    'nopack', 'pack32', 'blockeda', 'blockedb', 'blockeda-blockedb', 'blockeda-blockedb-transposedb',
+    'blockeda-blockedb-pack32', 'blockeda-blockedb-transposedb-pack32'
+]
+LINE_VALS = [f'triton-cpu-{opt}{prefix}' for prefix in ['-single', '']
+             for opt in AMX_OPTS] + ['torch-cpu-native', 'torch-cpu-compile']
 LINE_NAMES = LINE_VALS
 LINE_STYLES = [('blue', '--')] * len(LINE_VALS)
 
@@ -689,7 +503,7 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
         ylabel='GFLOPS',  # Label name for the y-axis.
         plot_name=
         # Name for the plot. Used also as a file name for saving the plot.
-        f'matmul-performance-bf16 (BLOCK_SIZE_M={BLOCK_SIZE_M}, BLOCK_SIZE_N={BLOCK_SIZE_N}, BLOCK_SIZE_K={BLOCK_SIZE_K}, GROUP_SIZE_M={GROUP_SIZE_M})',
+        f'matmul-performance-bf16 (BLOCK_SIZE_M={BLOCK_SIZE_M}, BLOCK_SIZE_N={BLOCK_SIZE_N}, BLOCK_SIZE_K={BLOCK_SIZE_K}, GROUP_SIZE_M={GROUP_SIZE_M}), GROUP_SIZE_N={GROUP_SIZE_N})',
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(M, N, K, provider):
@@ -704,12 +518,17 @@ def benchmark(M, N, K, provider):
             c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
             if 'blockeda' in provider:
                 ab = torch.empty_like(a)
-                prepack_kernel[(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K)](a, ab, M, K, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_K, BLOCKED_OUTPUT=True, TRANSPOSE=False, PACK32=False)
+                prepack_kernel[(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K)](a, ab, M, K, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                                                       BLOCK_SIZE_N=BLOCK_SIZE_K, BLOCKED_OUTPUT=True,
+                                                                       TRANSPOSE=False, PACK32=False)
                 a = ab
             if 'blockedb' in provider or 'pack32' in provider:
                 bb = torch.empty_like(b)
-                prepack_kernel[(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N)](b, bb, K, N, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCKED_OUTPUT='blockedb' in provider, TRANSPOSE='transposedb' in provider, PACK32='pack32' in provider)
-                b = bib
+                prepack_kernel[(K // BLOCK_SIZE_K,
+                                N // BLOCK_SIZE_N)](b, bb, K, N, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                                    BLOCKED_OUTPUT='blockedb' in provider, TRANSPOSE='transposedb'
+                                                    in provider, PACK32='pack32' in provider)
+                b = bb
         else:
             c = torch.zeros((M, N), device=a.device, dtype=torch.bfloat16)
         triton.runtime.driver.set_active_to_cpu()
@@ -738,17 +557,9 @@ def benchmark(M, N, K, provider):
     elif provider == 'triton-cpu-single':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, c), quantiles=quantiles, device_type=device)
     elif 'triton-cpu' in provider:
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_amx(a, b, c, 'blockeda' in provider, 'blockedb' in provider, 'transposedb' in provider, 'pack32' in provider), quantiles=quantiles, device_type=device)
-    elif provider == 'triton-cpu':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, c), quantiles=quantiles, device_type=device)
-    elif provider == 'triton-cpu-prepack-single':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_amx_interleaved(a, b, c), quantiles=quantiles, device_type=device)
-    elif provider == 'triton-cpu-prepack':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_amx_interleaved(a, b, c), quantiles=quantiles, device_type=device)
-    elif provider == 'triton-cpu-prepack-blocked-single':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_amx_interleaved_blocked(a, b, c), quantiles=quantiles, device_type=device)
-    elif provider == 'triton-cpu-prepack-blocked':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_amx_interleaved_blocked(a, b, c), quantiles=quantiles, device_type=device)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: matmul_amx(a, b, c, 'blockeda' in provider, 'blockedb' in provider, 'transposedb' in provider,
+                               'pack32' in provider), quantiles=quantiles, device_type=device)
     perf = lambda ms: 2 * M * N * K * 1e-9 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
