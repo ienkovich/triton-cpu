@@ -1,4 +1,3 @@
-import os
 import pytest
 import torch
 
@@ -7,9 +6,8 @@ import triton.language as tl
 
 
 @triton.jit
-def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
-                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                   BLOCKED_OUTPUT: tl.constexpr, TRANSPOSE: tl.constexpr,
+def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                   BLOCK_SIZE_N: tl.constexpr, BLOCKED_OUTPUT: tl.constexpr, TRANSPOSE: tl.constexpr,
                    PACK32: tl.constexpr):
     B_PACK_SCALE: tl.constexpr = 32 // in_p.type.element_ty.primitive_bitwidth if PACK32 else 1
     tl.static_assert(B_PACK_SCALE >= 1 and B_PACK_SCALE <= 4)
@@ -41,15 +39,11 @@ def prepack_kernel(in_p, out_p, M: tl.constexpr, N: tl.constexpr,
 
 
 @triton.jit
-def matmul_kernel_amx(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-        # number of blocks in a group
-        GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr,
-        BLOCKED_A: tl.constexpr, BLOCKED_B: tl.constexpr,
-        TRANSPOSED_B: tl.constexpr, PACKED_B: tl.constexpr
-):
+def matmul_kernel_amx(a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                      BLOCK_SIZE_K: tl.constexpr,
+                      # number of blocks in a group
+                      GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_N: tl.constexpr, BLOCKED_A: tl.constexpr,
+                      BLOCKED_B: tl.constexpr, TRANSPOSED_B: tl.constexpr, PACKED_B: tl.constexpr):
     pid = tl.program_id(axis=0)
     group_id = pid // (GROUP_SIZE_M * GROUP_SIZE_N)
     groups_n = N // BLOCK_SIZE_N // GROUP_SIZE_N
@@ -77,13 +71,17 @@ def matmul_kernel_amx(
         b_stride_block_n = BLOCK_SIZE_K * BLOCK_SIZE_N if BLOCKED_B else PACKED_BLOCK_SIZE_N
         b_stride_block_k = BLOCK_SIZE_K * N
 
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K, BLOCK_SIZE_M, BLOCK_SIZE_K),
-                                    strides=(a_stride_block_m, a_stride_block_k, a_stride_m, a_stride_k), offsets=(block_m, 0, 0, 0),
-                                    block_shape=(1, 1, BLOCK_SIZE_M, BLOCK_SIZE_K), order=(3, 2, 1, 0))
-    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N),
-                                    strides=(b_stride_block_k, b_stride_block_n, b_stride_k, b_stride_n), offsets=(0, block_n, 0, 0),
-                                    block_shape=(1, 1, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N), order=(3, 2, 1, 0))
-    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(block_m * BLOCK_SIZE_M, block_n * BLOCK_SIZE_N),
+    a_block_ptr = tl.make_block_ptr(base=a_ptr,
+                                    shape=(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K, BLOCK_SIZE_M, BLOCK_SIZE_K),
+                                    strides=(a_stride_block_m, a_stride_block_k, a_stride_m, a_stride_k),
+                                    offsets=(block_m, 0, 0, 0), block_shape=(1, 1, BLOCK_SIZE_M, BLOCK_SIZE_K),
+                                    order=(3, 2, 1, 0))
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr, shape=(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N),
+        strides=(b_stride_block_k, b_stride_block_n, b_stride_k, b_stride_n), offsets=(0, block_n, 0, 0),
+        block_shape=(1, 1, PACKED_BLOCK_SIZE_K, PACKED_BLOCK_SIZE_N), order=(3, 2, 1, 0))
+    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1),
+                                    offsets=(block_m * BLOCK_SIZE_M, block_n * BLOCK_SIZE_N),
                                     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
 
     c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -98,14 +96,19 @@ def matmul_kernel_amx(
 
     tl.store(c_block_ptr, c)
 
-@pytest.mark.parametrize("M, N, K", [(m, n, k) for m in (128, 256, 512) for n in (128, 256, 512) for k in (128, 256, 512)])
-@pytest.mark.parametrize("lhs_dtype, rhs_dtype, res_dtype", [('bfloat16', 'bfloat16', 'float32'), ('float16', 'float16', 'float32')])
-@pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K", [(m, n, k) for m in (16, 32) for n in (16, 32) for k in (32, 64)])
+
+@pytest.mark.parametrize("M, N, K",
+                         [(m, n, k) for m in (128, 256, 512) for n in (128, 256, 512) for k in (128, 256, 512)])
+@pytest.mark.parametrize("lhs_dtype, rhs_dtype, res_dtype", [('bfloat16', 'bfloat16', 'float32'),
+                                                             ('float16', 'float16', 'float32')])
+@pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K",
+                         [(m, n, k) for m in (16, 32) for n in (16, 32) for k in (32, 64)])
 @pytest.mark.parametrize("GROUP_SIZE_M, GROUP_SIZE_N", [(1, 1), (2, 2), (2, 4), (4, 2), (4, 4)])
 @pytest.mark.parametrize("BLOCKED_A", [False, True])
 @pytest.mark.parametrize("BLOCKED_B, TRANSPOSED_B", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("PACKED_B", [False, True])
-def test_matmul(M, N, K, lhs_dtype, rhs_dtype, res_dtype, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, GROUP_SIZE_N, BLOCKED_A, BLOCKED_B, TRANSPOSED_B, PACKED_B, device):
+def test_matmul(M, N, K, lhs_dtype, rhs_dtype, res_dtype, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+                GROUP_SIZE_N, BLOCKED_A, BLOCKED_B, TRANSPOSED_B, PACKED_B, device):
     assert M % (GROUP_SIZE_M * BLOCK_SIZE_M) == 0, f"M={M}, GROUP_SIZE_M={GROUP_SIZE_M}, BLOCK_SIZE_M={BLOCK_SIZE_M}"
     assert N % (GROUP_SIZE_N * BLOCK_SIZE_N) == 0, f"N={N}, GROUP_SIZE_N={GROUP_SIZE_N}, BLOCK_SIZE_N={BLOCK_SIZE_N}"
     assert K % BLOCK_SIZE_K == 0, f"K={K}, BLOCK_SIZE_K={BLOCK_SIZE_K}"
@@ -119,22 +122,25 @@ def test_matmul(M, N, K, lhs_dtype, rhs_dtype, res_dtype, BLOCK_SIZE_M, BLOCK_SI
 
     if BLOCKED_A:
         ab = torch.empty_like(a)
-        prepack_kernel[(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K)](a, ab, M, K, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_K, BLOCKED_OUTPUT=True, TRANSPOSE=False, PACK32=False)
+        prepack_kernel[(M // BLOCK_SIZE_M, K // BLOCK_SIZE_K)](a, ab, M, K, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                                               BLOCK_SIZE_N=BLOCK_SIZE_K, BLOCKED_OUTPUT=True,
+                                                               TRANSPOSE=False, PACK32=False)
         a = ab
 
     if BLOCKED_B or PACKED_B:
         bb = torch.empty_like(b)
-        prepack_kernel[(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N)](b, bb, K, N, BLOCK_SIZE_M=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCKED_OUTPUT=BLOCKED_B, TRANSPOSE=TRANSPOSED_B, PACK32=PACKED_B)
+        prepack_kernel[(K // BLOCK_SIZE_K, N // BLOCK_SIZE_N)](b, bb, K, N, BLOCK_SIZE_M=BLOCK_SIZE_K,
+                                                               BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCKED_OUTPUT=BLOCKED_B,
+                                                               TRANSPOSE=TRANSPOSED_B, PACK32=PACKED_B)
         b = bb
 
-    grid = ((M // BLOCK_SIZE_M) * (N // BLOCK_SIZE_N),)
+    grid = ((M // BLOCK_SIZE_M) * (N // BLOCK_SIZE_N), )
     matmul_kernel_amx[grid](
         a, b, c,  #
         M, N, K,  #
         BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,  #
         GROUP_SIZE_M=GROUP_SIZE_M, GROUP_SIZE_N=GROUP_SIZE_N,  #
         BLOCKED_A=BLOCKED_A, BLOCKED_B=BLOCKED_B,  #
-        TRANSPOSED_B=TRANSPOSED_B, PACKED_B=PACKED_B
-    )
+        TRANSPOSED_B=TRANSPOSED_B, PACKED_B=PACKED_B)
 
     torch.testing.assert_close(c, ref, atol=1e-2, rtol=0)
